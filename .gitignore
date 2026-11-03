@@ -218,3 +218,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── MDViewer specific ─────────────────────────────────────────────────────────
+
+# Application logs
+logs/
+
+# PyInstaller artefacts
+dist/
+build/
+*.spec
+
+# Kiro IDE
+.kiro/
+
+# macOS
+.DS_Store
