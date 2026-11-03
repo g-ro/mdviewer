@@ -18,11 +18,11 @@ import PyInstaller.__main__
 
 
 def build_exe() -> None:
-    script_dir  = os.path.dirname(os.path.abspath(__file__))
-    main_script = os.path.join(script_dir, "src", "main.py")
-    src_dir     = os.path.join(script_dir, "src")
+    script_dir   = os.path.dirname(os.path.abspath(__file__))
+    main_script  = os.path.join(script_dir, "src", "main.py")
+    src_dir      = os.path.join(script_dir, "src")
+    resources_dir = os.path.join(src_dir, "resources")
 
-    # Optional icon — skip silently if not present
     icon_path = os.path.join(script_dir, "resources", "mdviewer.ico")
     icon_args = [f"--icon={icon_path}"] if os.path.exists(icon_path) else []
 
@@ -30,17 +30,21 @@ def build_exe() -> None:
         main_script,
         "--name=MDViewer",
         "--onefile",
-        "--windowed",   # no console window
+        "--windowed",
         "--clean",
         "--noconfirm",
 
-        # ── Key fix ────────────────────────────────────────────────────
-        # Tell PyInstaller where the app's own modules live so it can
-        # collect views.*, utils.*, and version during static analysis.
+        # ── Tell PyInstaller where the app's own modules live ──────────
         f"--paths={src_dir}",
 
-        # ── App modules (hidden-import as belt-and-suspenders) ─────────
+        # ── Bundle the CSS resource file ───────────────────────────────
+        f"--add-data={resources_dir}{os.pathsep}resources",
+
+        # ── App modules (belt-and-suspenders hidden imports) ───────────
         "--hidden-import=version",
+        "--hidden-import=config",
+        "--hidden-import=models",
+        "--hidden-import=models.tab_model",
         "--hidden-import=views",
         "--hidden-import=views.main_window",
         "--hidden-import=views.file_explorer",
@@ -48,6 +52,7 @@ def build_exe() -> None:
         "--hidden-import=utils",
         "--hidden-import=utils.logging_config",
         "--hidden-import=utils.md_converter",
+        "--hidden-import=utils.renderer",
 
         # ── tkinter ────────────────────────────────────────────────────
         "--hidden-import=tkinter",
@@ -72,9 +77,10 @@ def build_exe() -> None:
         *icon_args,
     ]
 
-    print(f"Entry point : {main_script}")
-    print(f"Module path : {src_dir}")
-    print(f"Output dir  : {os.path.join(script_dir, 'dist')}")
+    print(f"Entry point  : {main_script}")
+    print(f"Module path  : {src_dir}")
+    print(f"Resources    : {resources_dir}")
+    print(f"Output dir   : {os.path.join(script_dir, 'dist')}")
     print()
     PyInstaller.__main__.run(args)
 

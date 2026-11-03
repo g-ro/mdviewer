@@ -229,7 +229,10 @@ class DocumentViewer(ttk.Frame):
         content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
 
-        self._renderer: RendererProtocol = make_renderer(content)
+        self._renderer: RendererProtocol = make_renderer(
+            content,
+            on_navigate=self._on_renderer_navigate,
+        )
         self._renderer.get_widget().grid(row=0, column=0, sticky="nsew")
 
         self._render_welcome()
@@ -385,6 +388,13 @@ class DocumentViewer(ttk.Frame):
             )
             base_url = ""
         return html, base_url
+
+    def _on_renderer_navigate(self, local_path: str) -> None:
+        """
+        Called by the renderer when the user clicks a link to a local .md file.
+        Opens the target file as a new tab instead of navigating within the renderer.
+        """
+        self.open_file(local_path)
 
     def _render_welcome(self) -> None:
         self._renderer.load_html(_WELCOME_HTML, "")
