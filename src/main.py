@@ -25,8 +25,8 @@ def main() -> None:
     style = ttk.Style()
     try:
         style.theme_use("clam")
-    except Exception:
-        pass
+    except tk.TclError:
+        logger.warning("Theme 'clam' unavailable; using default theme")
 
     MainWindow(root)
 

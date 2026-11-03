@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Main application window for MDViewer."""
+from __future__ import annotations
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import webbrowser
@@ -16,7 +18,17 @@ from version import (
 
 
 class MainWindow:
-    def __init__(self, root: tk.Tk):
+    """
+    Root application window.
+
+    Responsibilities:
+    - Layout (PanedWindow → FileExplorer | DocumentViewer)
+    - Menu + keyboard shortcuts
+    - Status bar
+    - Application lifecycle (startup, quit)
+    """
+
+    def __init__(self, root: tk.Tk) -> None:
         logger.info("Initializing MDViewer")
         self.root = root
         self.root.title(f"{__title__} v{__version__}")
@@ -31,18 +43,23 @@ class MainWindow:
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(0, weight=1)
 
+        # Status bar must be created before DocumentViewer so the lambda
+        # referencing _status_var is safe at first call
+        self._status_var = tk.StringVar(value="Ready")
+
         paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
         paned.grid(row=0, column=0, sticky="nsew")
 
         self.explorer = FileExplorer(paned, on_file_open=self._open_file)
         paned.add(self.explorer, weight=1)
 
-        self.viewer = DocumentViewer(paned)
+        # Callback injected at construction — no post-hoc attribute assignment
+        self.viewer = DocumentViewer(
+            paned,
+            on_status_update=lambda msg: self._status_var.set(msg),
+        )
         paned.add(self.viewer, weight=4)
-        self.viewer.on_status_update = lambda msg: self._status_var.set(msg)
 
-        # Status bar
-        self._status_var = tk.StringVar(value="Ready")
         ttk.Label(
             main_frame, textvariable=self._status_var,
             relief=tk.SUNKEN, anchor=tk.W,
@@ -61,7 +78,7 @@ class MainWindow:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open File…      Ctrl+O", command=self._open_file_dialog)
-        file_menu.add_command(label="Open Folder…",  command=self._open_folder_dialog)
+        file_menu.add_command(label="Open Folder…",          command=self._open_folder_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="Close Tab        Ctrl+W", command=self.viewer.close_current_tab)
         file_menu.add_separator()
@@ -73,7 +90,7 @@ class MainWindow:
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=self._show_about)
+        help_menu.add_command(label="About",         command=self._show_about)
         help_menu.add_command(label="Visit Website", command=lambda: webbrowser.open(__website__))
 
     def _bind_shortcuts(self) -> None:
@@ -103,6 +120,7 @@ class MainWindow:
 
     # ------------------------------------------------------------------
     def _show_about(self) -> None:
+        """Display application information in a modal dialog."""
         win = tk.Toplevel(self.root)
         win.title(f"About {__title__}")
         win.geometry("420x300")

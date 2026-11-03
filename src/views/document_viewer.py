@@ -3,49 +3,44 @@
 """
 Tabbed document viewer — Eclipse-style overflow tabs.
 
+Architecture
+------------
+``DocumentViewer`` is a thin coordinator:
+
+  ``_TabBar``          — visual tab strip (no state knowledge)
+  ``TabModel``         — all tab-state logic (pure Python, unit-testable)
+  ``RendererProtocol`` — HTML rendering abstraction (swap backend freely)
+
 Virtual tab list
 ----------------
-Every opened file lives in the *virtual* tab list (just a file path — cheap).
+Every opened file lives in the virtual tab list (via ``TabModel``).
 The list is split into two tiers:
 
-  VISIBLE  (up to MAX_TABS):  HTML is loaded and held in memory.
-  OVERFLOW (unlimited):       Only the file path is stored.
+  VISIBLE  (up to ``cfg.max_tabs``): HTML held in memory + shown in tab bar.
+  OVERFLOW (unlimited):              Only file path stored; HTML discarded.
 
-The tab bar shows only visible tabs plus a "» N" overflow button when N > 0.
-Clicking the button shows a menu of hidden tab names.
-Selecting a hidden tab *promotes* it to visible (reloads from disk) and
-*demotes* the oldest visible tab to overflow (HTML discarded).
+A ``» N`` overflow button appears when N tabs are parked.
+Clicking it opens a menu; selecting a parked tab promotes it (reloads
+from disk), demoting the oldest visible tab in its place.
 
-Closing a visible tab with × removes it entirely (path freed) and, if there
-are overflow tabs, promotes the most-recently-parked one automatically.
-
-Single HtmlFrame
-----------------
-Only one HtmlFrame widget exists for the lifetime of the window.
-Switching between visible tabs simply calls load_html() with the stored HTML.
-This avoids the tkinterweb crash that occurs with multiple simultaneous
-HtmlFrame instances.
+Closing a visible tab (×) removes it entirely.  If overflow tabs exist,
+the most-recently-parked one is auto-promoted to fill the slot.
 """
+from __future__ import annotations
+
+import html as html_module
+import uuid
 import tkinter as tk
 from tkinter import ttk
+from dataclasses import dataclass
 from pathlib import Path
-import uuid
-from collections import OrderedDict
+from collections.abc import Callable
 
+from config import cfg
+from models.tab_model import TabData, TabModel
 from utils.logging_config import logger
 from utils.md_converter import convert_md_to_html
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-MAX_TABS: int = 5   # Max simultaneously *visible* (rendered) tabs. 0 = no limit.
-
-try:
-    from tkinterweb import HtmlFrame
-    _TKINTERWEB_AVAILABLE = True
-except ImportError:
-    _TKINTERWEB_AVAILABLE = False
-    logger.warning("tkinterweb not available — falling back to plain-text viewer")
+from utils.renderer import RendererProtocol, make_renderer
 
 _WELCOME_HTML = """\
 <!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -67,37 +62,57 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 
 
 # ---------------------------------------------------------------------------
-# Tab bar widget  (visible tabs only)
+# Tab bar widget (visual only — no state knowledge)
 # ---------------------------------------------------------------------------
+@dataclass
+class _TabEntry:
+    """Typed widget container for one tab button."""
+    tab_id: str
+    title:  str
+    outer:  tk.Frame
+    lbl:    tk.Label
+    close:  tk.Label
+
+
 class _TabBar(ttk.Frame):
-    """Horizontal strip of closeable tab buttons for *visible* tabs only."""
+    """
+    Horizontal strip of closeable tab buttons.
 
-    _ACTIVE   = "#ffffff"
-    _INACTIVE = "#d0d0d0"
-    _HOVER    = "#ebebeb"
+    Owns only the visual state (widgets + which tab is highlighted).
+    All semantic state (what file is open, overflow list) lives in TabModel.
+    """
 
-    def __init__(self, parent: tk.Widget, on_select, on_close):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        on_select: Callable[[str], None],
+        on_close:  Callable[[str], None],
+    ) -> None:
         super().__init__(parent, relief=tk.FLAT)
-        self._on_select = on_select
-        self._on_close  = on_close
-        self._tabs: list[dict] = []
-        self.active_id: str | None = None
+        self._on_select            = on_select
+        self._on_close             = on_close
+        self._tabs: list[_TabEntry] = []
+        self.active_id: str | None  = None
 
-        self._inner = tk.Frame(self, bg="#b8b8b8")
+        self._inner = tk.Frame(self, bg=cfg.tab_bar_background)
         self._inner.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
     # ------------------------------------------------------------------
     def add(self, tab_id: str, title: str) -> None:
-        outer = tk.Frame(self._inner, bg=self._INACTIVE, bd=1, relief=tk.RAISED)
+        outer = tk.Frame(self._inner, bg=cfg.tab_color_inactive,
+                         bd=1, relief=tk.RAISED)
         outer.pack(side=tk.LEFT, padx=(2, 0))
 
         lbl = tk.Label(outer, text=f"  {title}  ",
-                       bg=self._INACTIVE, cursor="hand2", pady=4)
+                       bg=cfg.tab_color_inactive, cursor="hand2", pady=4)
         lbl.pack(side=tk.LEFT)
 
-        close_lbl = tk.Label(outer, text=" × ", bg=self._INACTIVE,
+        close_lbl = tk.Label(outer, text=" × ", bg=cfg.tab_color_inactive,
                              fg="#666", cursor="hand2", pady=4)
         close_lbl.pack(side=tk.LEFT)
+
+        entry = _TabEntry(tab_id=tab_id, title=title,
+                          outer=outer, lbl=lbl, close=close_lbl)
 
         for w in (outer, lbl):
             w.bind("<Button-1>", lambda _e, tid=tab_id: self._on_select(tid))
@@ -105,35 +120,49 @@ class _TabBar(ttk.Frame):
         close_lbl.bind("<Button-1>", lambda _e, tid=tab_id: self._on_close(tid))
         close_lbl.bind("<Button-2>", lambda _e, tid=tab_id: self._on_close(tid))
 
-        self._tabs.append({"id": tab_id, "title": title,
-                           "outer": outer, "lbl": lbl, "close": close_lbl})
+        # Hover effect
+        for w in (outer, lbl, close_lbl):
+            w.bind("<Enter>", lambda _e, eid=tab_id: self._on_hover(eid, True))
+            w.bind("<Leave>", lambda _e, eid=tab_id: self._on_hover(eid, False))
+
+        self._tabs.append(entry)
         self._highlight(tab_id)
 
     def select(self, tab_id: str) -> None:
         self._highlight(tab_id)
 
     def remove(self, tab_id: str) -> str | None:
-        """Destroy the tab widget. Returns the tab_id that visually follows it."""
-        idx = next((i for i, t in enumerate(self._tabs) if t["id"] == tab_id), None)
+        """Destroy the tab widget. Returns the tab_id that now follows it."""
+        idx = next((i for i, t in enumerate(self._tabs) if t.tab_id == tab_id), None)
         if idx is None:
             return None
-        self._tabs[idx]["outer"].destroy()
+        self._tabs[idx].outer.destroy()
         self._tabs.pop(idx)
         if not self._tabs:
             self.active_id = None
             return None
-        successor = self._tabs[min(idx, len(self._tabs) - 1)]["id"]
+        successor = self._tabs[min(idx, len(self._tabs) - 1)].tab_id
         self._highlight(successor)
         return successor
 
     def count(self) -> int:
         return len(self._tabs)
 
+    # ------------------------------------------------------------------
     def _highlight(self, tab_id: str) -> None:
         self.active_id = tab_id
         for t in self._tabs:
-            color = self._ACTIVE if t["id"] == tab_id else self._INACTIVE
-            for w in (t["outer"], t["lbl"], t["close"]):
+            color = cfg.tab_color_active if t.tab_id == tab_id else cfg.tab_color_inactive
+            for w in (t.outer, t.lbl, t.close):
+                w.configure(bg=color)
+
+    def _on_hover(self, tab_id: str, entering: bool) -> None:
+        if tab_id == self.active_id:
+            return
+        color = cfg.tab_color_hover if entering else cfg.tab_color_inactive
+        entry = next((t for t in self._tabs if t.tab_id == tab_id), None)
+        if entry:
+            for w in (entry.outer, entry.lbl, entry.close):
                 w.configure(bg=color)
 
 
@@ -142,32 +171,25 @@ class _TabBar(ttk.Frame):
 # ---------------------------------------------------------------------------
 class DocumentViewer(ttk.Frame):
     """
-    Tabbed viewer with Eclipse-style overflow tabs and a single HtmlFrame.
+    Tabbed viewer: coordinates TabModel (state), _TabBar (visual),
+    and RendererProtocol (HTML output).
 
-    _vis  — OrderedDict[tab_id, {file_path, html, base_url}]
-              Visible tabs, oldest-first (front = demote candidate).
-
-    _ovf  — OrderedDict[tab_id, file_path]
-              Overflow (parked) tabs, oldest-first (front = auto-promote candidate).
-              Only file paths are stored here — no HTML in memory.
-
-    _path_tab — dict[file_path, tab_id]
-              Reverse lookup that spans both tiers.
+    ``on_status_update`` is injected via the constructor so the dependency
+    is explicit and the class is self-contained from construction.
     """
 
-    def __init__(self, parent: tk.Widget):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        on_status_update: Callable[[str], None] | None = None,
+    ) -> None:
         super().__init__(parent)
-        self._vis:      OrderedDict[str, dict] = OrderedDict()
-        self._ovf:      OrderedDict[str, str]  = OrderedDict()
-        self._path_tab: dict[str, str]          = {}
-
-        # Injected by MainWindow
-        self.on_status_update = None   # (msg: str) -> None
-
+        self._model            = TabModel(max_visible=cfg.max_tabs)
+        self._on_status_update = on_status_update
         self._build_ui()
 
     # ------------------------------------------------------------------
-    # UI
+    # UI construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -184,8 +206,8 @@ class DocumentViewer(ttk.Frame):
         # ── Tab row: strip + overflow button ─────────────────────────
         tab_row = ttk.Frame(self)
         tab_row.grid(row=1, column=0, sticky="ew")
-        tab_row.columnconfigure(0, weight=1)   # tab strip grows
-        tab_row.columnconfigure(1, weight=0)   # overflow button fixed
+        tab_row.columnconfigure(0, weight=1)
+        tab_row.columnconfigure(1, weight=0)
 
         self._tab_bar = _TabBar(tab_row,
                                 on_select=self._select_visible,
@@ -195,26 +217,20 @@ class DocumentViewer(ttk.Frame):
         self._ovf_btn = tk.Button(
             tab_row, text="»  0", width=6,
             command=self._show_overflow_menu,
-            relief=tk.FLAT, bg="#b8b8b8", fg="#222",
+            relief=tk.FLAT, bg=cfg.tab_bar_background, fg="#222",
             font=("", 9, "bold"), cursor="hand2",
         )
         self._ovf_btn.grid(row=0, column=1, padx=(2, 0), pady=(2, 0))
-        self._ovf_btn.grid_remove()   # hidden until there is overflow
+        self._ovf_btn.grid_remove()
 
-        # ── Single HtmlFrame ─────────────────────────────────────────
+        # ── Single renderer ───────────────────────────────────────────
         content = ttk.Frame(self)
         content.grid(row=2, column=0, sticky="nsew")
         content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
 
-        if _TKINTERWEB_AVAILABLE:
-            self._renderer = HtmlFrame(content, messages_enabled=False,
-                                       vertical_scrollbar=True)
-        else:
-            from tkinter.scrolledtext import ScrolledText
-            self._renderer = ScrolledText(content, wrap=tk.WORD,
-                                          font=("Courier New", 11))
-        self._renderer.grid(row=0, column=0, sticky="nsew")
+        self._renderer: RendererProtocol = make_renderer(content)
+        self._renderer.get_widget().grid(row=0, column=0, sticky="nsew")
 
         self._render_welcome()
 
@@ -222,132 +238,116 @@ class DocumentViewer(ttk.Frame):
     # Public API
     # ------------------------------------------------------------------
     def open_file(self, file_path: str) -> None:
-        """Open *file_path*, promoting it if it's already parked in overflow."""
+        """Open *file_path*: switch/promote if already known, else load fresh."""
         path = str(Path(file_path).resolve())
 
-        if path in self._path_tab:
-            tab_id = self._path_tab[path]
-            if tab_id in self._vis:
-                self._select_visible(tab_id)          # already visible
+        if self._model.is_open(path):
+            tab_id = self._model.tab_id_for(path)
+            if self._model.is_visible(tab_id):
+                self._select_visible(tab_id)
             else:
-                self._promote(tab_id)                 # parked → front
+                self._promote(tab_id)
             return
 
-        # Brand-new file
-        if MAX_TABS > 0 and self._tab_bar.count() >= MAX_TABS:
-            self._demote_oldest_visible()
-
-        tab_id = str(uuid.uuid4())
         html, base_url = self._render_file(path)
-        self._vis[tab_id]      = {"file_path": path, "html": html, "base_url": base_url}
-        self._path_tab[path]   = tab_id
+        tab_id = str(uuid.uuid4())
+        data   = TabData(tab_id=tab_id, file_path=path,
+                         html=html, base_url=base_url)
+
+        demoted_id = self._model.add_visible(data)
+        if demoted_id:
+            self._tab_bar.remove(demoted_id)
+            demoted_name = Path(
+                self._model.get_overflow_path(demoted_id) or ""
+            ).name
+            self._notify(
+                f'"{demoted_name}" moved to overflow  —  click » to bring it back'
+            )
+
         self._tab_bar.add(tab_id, Path(path).name)
-        self._load(html, base_url)
+        self._renderer.load_html(html, base_url)
+        self._update_overflow_btn()
 
     def close_current_tab(self) -> None:
-        tab_id = self._tab_bar.active_id
-        if tab_id:
-            self._close_visible(tab_id)
+        if self._tab_bar.active_id:
+            self._close_visible(self._tab_bar.active_id)
 
     def refresh_current_tab(self) -> None:
         tab_id = self._tab_bar.active_id
-        if not tab_id or tab_id not in self._vis:
+        if not tab_id or not self._model.is_visible(tab_id):
             return
-        data = self._vis[tab_id]
-        data["html"], data["base_url"] = self._render_file(data["file_path"])
-        self._load(data["html"], data["base_url"])
+        data = self._model.get_visible(tab_id)
+        if not data:
+            return
+        html, base_url = self._render_file(data.file_path)
+        self._model.update_visible_html(tab_id, html, base_url)
+        self._renderer.load_html(html, base_url)
 
     # ------------------------------------------------------------------
     # Visible-tab callbacks (wired to _TabBar)
     # ------------------------------------------------------------------
     def _select_visible(self, tab_id: str) -> None:
         self._tab_bar.select(tab_id)
-        if tab_id in self._vis:
-            d = self._vis[tab_id]
-            self._load(d["html"], d["base_url"])
+        data = self._model.get_visible(tab_id)
+        if data:
+            self._renderer.load_html(data.html, data.base_url)
 
     def _close_visible(self, tab_id: str) -> None:
         """
-        Close a visible tab.
-        If overflow tabs exist, the most-recently-parked one is auto-promoted
-        (fills the vacated slot), keeping the tab bar as full as possible.
+        Close a visible tab.  Auto-promotes the most-recently-parked
+        overflow tab if one exists (keeps the tab bar as full as possible).
         """
-        data = self._vis.pop(tab_id, None)
-        if data:
-            self._path_tab.pop(data["file_path"], None)
+        auto_promote_id = self._model.close_visible(tab_id)
+        successor       = self._tab_bar.remove(tab_id)
 
-        successor = self._tab_bar.remove(tab_id)   # visual removal
-
-        # Auto-promote the most-recently-parked overflow tab (last in _ovf)
-        if self._ovf:
-            promote_id = next(reversed(self._ovf))  # most recently parked
-            self._promote(promote_id, after_close=True)
-            return   # _promote handles rendering and overflow btn update
+        if auto_promote_id:
+            # A slot just freed up; promoting won't trigger another demotion
+            self._promote(auto_promote_id)
+            return
 
         self._update_overflow_btn()
-
-        if successor:
+        if self._model.visible_count > 0 and successor:
             self._select_visible(successor)
-        elif self._vis:
-            # successor might be stale; select whatever is still active
+        elif self._model.visible_count > 0 and self._tab_bar.active_id:
             self._select_visible(self._tab_bar.active_id)
         else:
             self._render_welcome()
 
     # ------------------------------------------------------------------
-    # Demote / promote
+    # Overflow helpers
     # ------------------------------------------------------------------
-    def _demote_oldest_visible(self) -> None:
-        """
-        Move the oldest visible tab to overflow (discard its HTML).
-        Does NOT update the renderer — caller is responsible for that.
-        """
-        oldest_id = next(iter(self._vis))
-        data = self._vis.pop(oldest_id)
-        self._ovf[oldest_id] = data["file_path"]  # keep only path
-        self._tab_bar.remove(oldest_id)            # visual only
-        self._update_overflow_btn()
-
-        name = Path(data["file_path"]).name
-        if self.on_status_update:
-            self.on_status_update(
-                f'"{name}" moved to overflow  —  click » to bring it back'
-            )
-
-    def _promote(self, tab_id: str, *, after_close: bool = False) -> None:
-        """
-        Move an overflow tab to the front (visible).
-        Reloads the file from disk.
-        If visible slots are full and this isn't called after a close, demote first.
-        """
-        file_path = self._ovf.pop(tab_id)
-
-        if not after_close and MAX_TABS > 0 and self._tab_bar.count() >= MAX_TABS:
-            self._demote_oldest_visible()
+    def _promote(self, tab_id: str) -> None:
+        """Load a parked tab from disk and make it the active visible tab."""
+        file_path = self._model.get_overflow_path(tab_id)
+        if not file_path:
+            return
 
         html, base_url = self._render_file(file_path)
-        self._vis[tab_id] = {"file_path": file_path, "html": html, "base_url": base_url}
-        # _path_tab entry already exists (tab_id was registered when first opened)
+        demoted_id = self._model.promote(tab_id, html, base_url)
+
+        if demoted_id:
+            self._tab_bar.remove(demoted_id)
+            demoted_name = Path(
+                self._model.get_overflow_path(demoted_id) or ""
+            ).name
+            self._notify(f'"{demoted_name}" moved to overflow')
 
         self._tab_bar.add(tab_id, Path(file_path).name)
-        self._load(html, base_url)
+        self._renderer.load_html(html, base_url)
         self._update_overflow_btn()
 
-    # ------------------------------------------------------------------
-    # Overflow menu
-    # ------------------------------------------------------------------
     def _show_overflow_menu(self) -> None:
-        if not self._ovf:
+        items = self._model.overflow_items  # [(tab_id, path), …] most-recent first
+        if not items:
             return
         menu = tk.Menu(self, tearoff=0)
-        for tab_id, file_path in reversed(self._ovf.items()):
+        for tab_id, file_path in items:
             p = Path(file_path)
-            # Show filename bold + dimmed parent path
             menu.add_command(
                 label=f"  {p.name}   ({p.parent})",
                 command=lambda tid=tab_id: self._promote(tid),
             )
-        if len(self._ovf) > 1:
+        if len(items) > 1:
             menu.add_separator()
             menu.add_command(label="  Close all hidden tabs",
                              command=self._close_all_overflow)
@@ -357,13 +357,11 @@ class DocumentViewer(ttk.Frame):
                       btn.winfo_rooty() + btn.winfo_height())
 
     def _close_all_overflow(self) -> None:
-        for file_path in list(self._ovf.values()):
-            self._path_tab.pop(file_path, None)
-        self._ovf.clear()
+        self._model.close_all_overflow()
         self._update_overflow_btn()
 
     def _update_overflow_btn(self) -> None:
-        n = len(self._ovf)
+        n = self._model.overflow_count
         if n:
             self._ovf_btn.configure(text=f"»  {n}")
             self._ovf_btn.grid()
@@ -374,29 +372,23 @@ class DocumentViewer(ttk.Frame):
     # Rendering helpers
     # ------------------------------------------------------------------
     def _render_file(self, file_path: str) -> tuple[str, str]:
-        """Return (html, base_url) for *file_path*. Never raises."""
+        """Return (html, base_url).  Never raises — returns an error page on failure."""
         try:
             html     = convert_md_to_html(file_path)
             base_url = Path(file_path).parent.as_uri() + "/"
         except Exception as exc:
             logger.exception("Failed to render %s", file_path)
-            html     = (f'<p style="color:red;font-family:sans-serif">'
-                        f'Error loading file:<br>{exc}</p>')
+            safe_msg = html_module.escape(str(exc))
+            html     = (
+                f'<p style="color:red;font-family:sans-serif">'
+                f"Error loading file:<br>{safe_msg}</p>"
+            )
             base_url = ""
         return html, base_url
 
-    def _load(self, html: str, base_url: str) -> None:
-        if _TKINTERWEB_AVAILABLE:
-            try:
-                self._renderer.load_html(html, base_url=base_url)
-            except TypeError:
-                self._renderer.load_html(html)
-        else:
-            import re
-            self._renderer.config(state=tk.NORMAL)
-            self._renderer.delete("1.0", tk.END)
-            self._renderer.insert(tk.END, re.sub(r"<[^>]+>", "", html))
-            self._renderer.config(state=tk.DISABLED)
-
     def _render_welcome(self) -> None:
-        self._load(_WELCOME_HTML, "")
+        self._renderer.load_html(_WELCOME_HTML, "")
+
+    def _notify(self, message: str) -> None:
+        if self._on_status_update:
+            self._on_status_update(message)

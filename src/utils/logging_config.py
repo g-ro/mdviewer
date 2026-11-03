@@ -1,67 +1,116 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Logging configuration for MDViewer."""
+"""
+Logging configuration for MDViewer.
+
+Lazy initialisation
+-------------------
+The logger is created on first use, not at import time.  This means:
+  * No directory is created just by importing this module.
+  * Tests don't get a stray ``logs/`` directory in their working directory.
+  * A frozen exe launched from any location writes logs to %APPDATA%\\MDViewer\\logs.
+
+Usage
+-----
+    from utils.logging_config import logger
+    logger.info("...")
+
+    # In main.py only:
+    from utils.logging_config import install_global_exception_hooks
+    install_global_exception_hooks(root)
+"""
+from __future__ import annotations
+
 import logging
 import logging.handlers
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
-from version import __title__
+_APP_NAME         = "MDViewer"
+_logger_instance: logging.Logger | None = None
+_initialised      = False
 
-LOGS_DIR = Path("logs")
-LOGS_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOGS_DIR / f"{__title__.lower()}.log"
-
-LOG_FORMAT = (
+_FMT_FILE    = (
     "%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - "
     "%(funcName)s() - %(message)s"
 )
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+_FMT_CONSOLE = "%(asctime)s - %(levelname)s - %(message)s"
+_DATE_FMT    = "%Y-%m-%d %H:%M:%S"
 
 
-def setup_logger(
-    logger_name: str = __title__,
-    log_file: Path = LOG_FILE,
-    level: int = logging.INFO,
-    console_level: Optional[int] = None,
-) -> logging.Logger:
-    logger_obj = logging.getLogger(logger_name)
-    logger_obj.setLevel(level)
-
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
-    )
-    file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
-    logger_obj.addHandler(file_handler)
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(console_level or level)
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", DATE_FORMAT)
-    )
-    logger_obj.addHandler(console_handler)
-
-    return logger_obj
+def _log_path() -> Path:
+    """Return the log file path, creating parent directories as needed."""
+    log_dir = Path(os.environ.get("APPDATA", Path.home())) / _APP_NAME / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "mdviewer.log"
 
 
-logger = setup_logger()
+def get_logger() -> logging.Logger:
+    """Return the application logger, initialising it on first call."""
+    global _logger_instance, _initialised
+    if _initialised:
+        return _logger_instance  # type: ignore[return-value]
+
+    _initialised = True
+    instance = logging.getLogger(_APP_NAME)
+    instance.setLevel(logging.INFO)
+
+    fmt_file    = logging.Formatter(_FMT_FILE,    _DATE_FMT)
+    fmt_console = logging.Formatter(_FMT_CONSOLE, _DATE_FMT)
+
+    # File handler — skip silently if the path is not writable
+    try:
+        fh = logging.handlers.RotatingFileHandler(
+            _log_path(), maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        fh.setFormatter(fmt_file)
+        instance.addHandler(fh)
+    except OSError:
+        pass  # No write access — console only
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt_console)
+    instance.addHandler(ch)
+
+    _logger_instance = instance
+    return instance
+
+
+class _LazyLogger:
+    """
+    Proxy that delegates every attribute lookup to the real logger.
+
+    Allows ``from utils.logging_config import logger`` to work throughout
+    the codebase without initialising the logger at import time.
+    """
+    __slots__ = ()
+
+    def __getattr__(self, name: str):
+        return getattr(get_logger(), name)
+
+
+# Public name — all modules import this
+logger = _LazyLogger()
 
 
 def install_global_exception_hooks(root=None) -> None:
+    """Wire sys.excepthook and optionally the Tkinter callback hook."""
+
     def _excepthook(exc_type, exc_value, exc_traceback):
         if exc_type is KeyboardInterrupt:
             return
-        logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+        get_logger().error(
+            "Uncaught exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
 
     sys.excepthook = _excepthook
 
     if root is not None:
         try:
             def _tk_exception(exc_type, exc_value, exc_traceback):
-                logger.error(
+                get_logger().error(
                     "Tkinter callback exception",
                     exc_info=(exc_type, exc_value, exc_traceback),
                 )
@@ -70,4 +119,4 @@ def install_global_exception_hooks(root=None) -> None:
             pass
 
 
-__all__ = ["logger", "setup_logger", "install_global_exception_hooks"]
+__all__ = ["logger", "get_logger", "install_global_exception_hooks"]
