@@ -7,24 +7,27 @@ Architecture
 ------------
 ``DocumentViewer`` is a thin coordinator:
 
-  ``_TabBar``          — visual tab strip (no state knowledge)
-  ``TabModel``         — all tab-state logic (pure Python, unit-testable)
-  ``RendererProtocol`` — HTML rendering abstraction (swap backend freely)
+  ``_TabBar``         — visual tab strip (no state knowledge)
+  ``TabModel``        — all tab-state bookkeeping (pure Python, unit-testable)
+  ``RendererProtocol``— HTML display abstraction (swap backend freely)
+  ``TempHtmlStore``   — per-tab temp file lifecycle (stable URLs for tkinterweb)
 
 Virtual tab list
 ----------------
 Every opened file lives in the virtual tab list (via ``TabModel``).
 The list is split into two tiers:
 
-  VISIBLE  (up to ``cfg.max_tabs``): HTML held in memory + shown in tab bar.
-  OVERFLOW (unlimited):              Only file path stored; HTML discarded.
+  VISIBLE  (up to ``cfg.max_tabs``): HTML held in memory + temp file on disk.
+  OVERFLOW (unlimited):              Only file path stored; HTML and temp file
+                                     discarded to free memory and disk space.
 
-A ``» N`` overflow button appears when N tabs are parked.
-Clicking it opens a menu; selecting a parked tab promotes it (reloads
-from disk), demoting the oldest visible tab in its place.
-
-Closing a visible tab (×) removes it entirely.  If overflow tabs exist,
-the most-recently-parked one is auto-promoted to fill the slot.
+Temp file lifecycle
+-------------------
+  Tab becomes VISIBLE   → TempHtmlStore.write(tab_id, html, base_url)
+  Tab stays  VISIBLE    → renderer.load_url(store.uri_for(tab_id))
+  Tab becomes OVERFLOW  → TempHtmlStore.release(tab_id)
+  Tab is CLOSED         → TempHtmlStore.release(tab_id)
+  Process exits         → TempHtmlStore.cleanup_all()  [via atexit]
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ from models.tab_model import TabData, TabModel
 from utils.logging_config import logger
 from utils.md_converter import convert_md_to_html
 from utils.renderer import RendererProtocol, make_renderer
+from utils.temp_store import TempHtmlStore
 
 _WELCOME_HTML = """\
 <!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -79,7 +83,7 @@ class _TabBar(ttk.Frame):
     Horizontal strip of closeable tab buttons.
 
     Owns only the visual state (widgets + which tab is highlighted).
-    All semantic state (what file is open, overflow list) lives in TabModel.
+    All semantic state lives in ``TabModel``.
     """
 
     def __init__(
@@ -97,7 +101,6 @@ class _TabBar(ttk.Frame):
         self._inner = tk.Frame(self, bg=cfg.tab_bar_background)
         self._inner.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
-    # ------------------------------------------------------------------
     def add(self, tab_id: str, title: str) -> None:
         outer = tk.Frame(self._inner, bg=cfg.tab_color_inactive,
                          bd=1, relief=tk.RAISED)
@@ -120,7 +123,6 @@ class _TabBar(ttk.Frame):
         close_lbl.bind("<Button-1>", lambda _e, tid=tab_id: self._on_close(tid))
         close_lbl.bind("<Button-2>", lambda _e, tid=tab_id: self._on_close(tid))
 
-        # Hover effect
         for w in (outer, lbl, close_lbl):
             w.bind("<Enter>", lambda _e, eid=tab_id: self._on_hover(eid, True))
             w.bind("<Leave>", lambda _e, eid=tab_id: self._on_hover(eid, False))
@@ -132,7 +134,7 @@ class _TabBar(ttk.Frame):
         self._highlight(tab_id)
 
     def remove(self, tab_id: str) -> str | None:
-        """Destroy the tab widget. Returns the tab_id that now follows it."""
+        """Destroy the tab widget; returns the tab_id that now follows it."""
         idx = next((i for i, t in enumerate(self._tabs) if t.tab_id == tab_id), None)
         if idx is None:
             return None
@@ -148,7 +150,6 @@ class _TabBar(ttk.Frame):
     def count(self) -> int:
         return len(self._tabs)
 
-    # ------------------------------------------------------------------
     def _highlight(self, tab_id: str) -> None:
         self.active_id = tab_id
         for t in self._tabs:
@@ -171,11 +172,16 @@ class _TabBar(ttk.Frame):
 # ---------------------------------------------------------------------------
 class DocumentViewer(ttk.Frame):
     """
-    Tabbed viewer: coordinates TabModel (state), _TabBar (visual),
-    and RendererProtocol (HTML output).
+    Tabbed document viewer.
 
-    ``on_status_update`` is injected via the constructor so the dependency
-    is explicit and the class is self-contained from construction.
+    Coordinates four collaborators:
+      ``TabModel``      — tab-state (visible / overflow tiers)
+      ``_TabBar``       — visual tab strip
+      ``RendererProtocol`` — HTML display widget
+      ``TempHtmlStore`` — per-tab temp file lifecycle
+
+    ``on_status_update`` is injected at construction (not set post-hoc) so
+    the dependency is explicit and the class is self-contained from init.
     """
 
     def __init__(
@@ -185,6 +191,7 @@ class DocumentViewer(ttk.Frame):
     ) -> None:
         super().__init__(parent)
         self._model            = TabModel(max_visible=cfg.max_tabs)
+        self._temp_store       = TempHtmlStore()
         self._on_status_update = on_status_update
         self._build_ui()
 
@@ -260,6 +267,7 @@ class DocumentViewer(ttk.Frame):
         demoted_id = self._model.add_visible(data)
         if demoted_id:
             self._tab_bar.remove(demoted_id)
+            self._temp_store.release(demoted_id)       # free demoted tab's file
             demoted_name = Path(
                 self._model.get_overflow_path(demoted_id) or ""
             ).name
@@ -267,8 +275,10 @@ class DocumentViewer(ttk.Frame):
                 f'"{demoted_name}" moved to overflow  —  click » to bring it back'
             )
 
+        # Write temp file and load via stable file URI
+        self._temp_store.write(tab_id, html, base_url)
         self._tab_bar.add(tab_id, Path(path).name)
-        self._renderer.load_html(html, base_url)
+        self._renderer.load_url(self._temp_store.uri_for(tab_id))
         self._update_overflow_btn()
 
     def close_current_tab(self) -> None:
@@ -284,27 +294,29 @@ class DocumentViewer(ttk.Frame):
             return
         html, base_url = self._render_file(data.file_path)
         self._model.update_visible_html(tab_id, html, base_url)
-        self._renderer.load_html(html, base_url)
+        # Overwrite the existing temp file and reload
+        self._temp_store.write(tab_id, html, base_url)
+        self._renderer.load_url(self._temp_store.uri_for(tab_id))
 
     # ------------------------------------------------------------------
     # Visible-tab callbacks (wired to _TabBar)
     # ------------------------------------------------------------------
     def _select_visible(self, tab_id: str) -> None:
         self._tab_bar.select(tab_id)
-        data = self._model.get_visible(tab_id)
-        if data:
-            self._renderer.load_html(data.html, data.base_url)
+        if self._model.is_visible(tab_id):
+            # Each tab has its own stable URI — no force, no caching issue
+            self._renderer.load_url(self._temp_store.uri_for(tab_id))
 
     def _close_visible(self, tab_id: str) -> None:
         """
         Close a visible tab.  Auto-promotes the most-recently-parked
-        overflow tab if one exists (keeps the tab bar as full as possible).
+        overflow tab if one exists.
         """
         auto_promote_id = self._model.close_visible(tab_id)
         successor       = self._tab_bar.remove(tab_id)
+        self._temp_store.release(tab_id)               # delete the closed tab's file
 
         if auto_promote_id:
-            # A slot just freed up; promoting won't trigger another demotion
             self._promote(auto_promote_id)
             return
 
@@ -320,7 +332,7 @@ class DocumentViewer(ttk.Frame):
     # Overflow helpers
     # ------------------------------------------------------------------
     def _promote(self, tab_id: str) -> None:
-        """Load a parked tab from disk and make it the active visible tab."""
+        """Reload a parked tab from disk, write its temp file, make it active."""
         file_path = self._model.get_overflow_path(tab_id)
         if not file_path:
             return
@@ -330,17 +342,20 @@ class DocumentViewer(ttk.Frame):
 
         if demoted_id:
             self._tab_bar.remove(demoted_id)
+            self._temp_store.release(demoted_id)       # free the demoted tab's file
             demoted_name = Path(
                 self._model.get_overflow_path(demoted_id) or ""
             ).name
             self._notify(f'"{demoted_name}" moved to overflow')
 
+        # Write temp file for the promoted tab and display it
+        self._temp_store.write(tab_id, html, base_url)
         self._tab_bar.add(tab_id, Path(file_path).name)
-        self._renderer.load_html(html, base_url)
+        self._renderer.load_url(self._temp_store.uri_for(tab_id))
         self._update_overflow_btn()
 
     def _show_overflow_menu(self) -> None:
-        items = self._model.overflow_items  # [(tab_id, path), …] most-recent first
+        items = self._model.overflow_items
         if not items:
             return
         menu = tk.Menu(self, tearoff=0)
@@ -360,6 +375,7 @@ class DocumentViewer(ttk.Frame):
                       btn.winfo_rooty() + btn.winfo_height())
 
     def _close_all_overflow(self) -> None:
+        # Overflow tabs have no temp files (released when they were demoted)
         self._model.close_all_overflow()
         self._update_overflow_btn()
 
@@ -375,7 +391,7 @@ class DocumentViewer(ttk.Frame):
     # Rendering helpers
     # ------------------------------------------------------------------
     def _render_file(self, file_path: str) -> tuple[str, str]:
-        """Return (html, base_url).  Never raises — returns an error page on failure."""
+        """Convert a Markdown file to (html, base_url). Never raises."""
         try:
             html     = convert_md_to_html(file_path)
             base_url = Path(file_path).parent.as_uri() + "/"
@@ -389,15 +405,14 @@ class DocumentViewer(ttk.Frame):
             base_url = ""
         return html, base_url
 
-    def _on_renderer_navigate(self, local_path: str) -> None:
-        """
-        Called by the renderer when the user clicks a link to a local .md file.
-        Opens the target file as a new tab instead of navigating within the renderer.
-        """
-        self.open_file(local_path)
-
     def _render_welcome(self) -> None:
+        # Welcome screen has no links needing anchor navigation;
+        # load_html is fine and avoids writing an unnecessary temp file.
         self._renderer.load_html(_WELCOME_HTML, "")
+
+    def _on_renderer_navigate(self, local_path: str) -> None:
+        """Called when the user clicks a local .md link inside rendered content."""
+        self.open_file(local_path)
 
     def _notify(self, message: str) -> None:
         if self._on_status_update:

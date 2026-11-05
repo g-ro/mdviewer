@@ -9,84 +9,54 @@ Defines ``RendererProtocol`` and two concrete adapters:
 
 Use ``make_renderer(parent, on_navigate)`` to get the best available renderer.
 
-How anchor navigation works
-----------------------------
-tkinterweb resolves relative links against a "current URL".  When we use
-``load_html()`` directly, there is no current URL, so ``#section`` anchors
-have nowhere to resolve to.
-
-Instead we:
-  1. Pre-process the HTML, rewriting every relative ``src``/``href`` to an
-     absolute ``file://`` URL using the original file's directory as base.
-     This preserves images, cross-file links, etc.
-  2. Write the processed HTML to a temp file.
-  3. Load the temp file via ``load_url()``.
-
-Now ``<a href="#section">`` resolves to ``file:///tmp/render.html#section``.
-tkinterweb calls our ``on_link_click`` handler with that URL; we see the
-``.html`` extension, pass it back to ``load_url``, and tkinterweb scrolls to
-the anchor — exactly as a browser would.
-
-Link routing table
+Rendering strategy
 ------------------
-  http:// / https://          → webbrowser.open()
-  file:// + .md / .markdown   → on_navigate callback (new tab)
-  file:// + no extension      → suppressed (bare dir URL, safety net)
-  file:// + anything else     → load_url (images, CSS, .html with anchor)
-  other                       → load_url
+Documents are loaded via ``load_url(file_uri)`` where the URI points to a
+per-tab temp file managed by ``TempHtmlStore``.  This gives tkinterweb a
+stable, unique URL per tab so that:
+
+  * Switching tabs loads a different URL → no cache conflict, no ``force=True``
+  * Anchor links (``#section``) resolve against the temp file's URL
+    → tkinterweb can scroll to the target element naturally
+
+Welcome and error content that requires no anchor navigation is loaded via
+``load_html(html)`` directly, bypassing the file system.
+
+Link routing
+------------
+  http:// / https://            → webbrowser.open()
+  file:// + .md / .markdown     → on_navigate callback (open as new tab)
+  file:// + no extension        → suppressed (bare dir URL from anchor resolution)
+  file:// + other (.html, .png) → delegated to frame.load_url (anchor scroll, images)
+  other                         → delegated to frame.load_url
 """
 from __future__ import annotations
 
-import re
-import tempfile
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol, runtime_checkable
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urlparse
 
 
 # ---------------------------------------------------------------------------
-# URL helpers
+# URL helper  (used by _handle_link_click and importable by temp_store)
 # ---------------------------------------------------------------------------
-
-# Matches src="..." and href="..." (single or double quotes)
-_ATTR_RE = re.compile(r'(src|href)\s*=\s*(["\'])([^"\']*?)\2', re.IGNORECASE)
-
-
-def _make_urls_absolute(html: str, base_url: str) -> str:
-    """
-    Rewrite every relative ``src`` / ``href`` value in *html* to an absolute
-    URL by resolving it against *base_url*.
-
-    Leaves unchanged: anchors (``#``), external URLs, ``data:`` URIs,
-    ``mailto:``, and anything already absolute (``file://``, ``http://``).
-    """
-    def _replace(m: re.Match) -> str:
-        attr, quote, url = m.group(1), m.group(2), m.group(3)
-        if not url or url.startswith(
-            ("#", "http://", "https://", "data:", "file://", "mailto://", "mailto:")
-        ):
-            return m.group(0)
-        return f'{attr}={quote}{urljoin(base_url, url)}{quote}'
-
-    return _ATTR_RE.sub(_replace, html)
-
-
 def _file_url_to_path(url: str) -> str | None:
     """
-    Convert a ``file://`` URL to a local path, stripping any fragment.
-    Handles POSIX and Windows (``file:///C:/…``) formats.
-    Returns ``None`` if *url* is not a ``file://`` URL.
+    Convert a ``file://`` URL to a local filesystem path, stripping any
+    fragment.  Handles both POSIX (``file:///home/…``) and Windows
+    (``file:///C:/…``) formats.  Returns ``None`` for non-file URLs.
     """
     try:
         parsed = urlparse(url)
         if parsed.scheme != "file":
             return None
-        path = unquote(parsed.path)          # strips fragment automatically
+        path = unquote(parsed.path)
+        # Windows: /C:/path → C:/path
         if path.startswith("/") and len(path) > 2 and path[2] == ":":
-            path = path[1:]                  # Windows: /C:/… → C:/…
+            path = path[1:]
         return path
     except Exception:
         return None
@@ -97,9 +67,16 @@ def _file_url_to_path(url: str) -> str | None:
 # ---------------------------------------------------------------------------
 @runtime_checkable
 class RendererProtocol(Protocol):
-    """Minimal contract any HTML renderer must satisfy."""
+    """
+    Minimum interface any HTML renderer must satisfy.
+
+    ``load_html`` — render in-memory HTML (welcome screen, error pages).
+    ``load_url``  — render from a URL; enables anchor navigation.
+    ``get_widget`` — return the underlying tkinter widget for layout.
+    """
 
     def load_html(self, html: str, base_url: str = "") -> None: ...
+    def load_url(self, url: str) -> None: ...
     def get_widget(self) -> tk.Widget: ...
 
 
@@ -108,13 +85,17 @@ class RendererProtocol(Protocol):
 # ---------------------------------------------------------------------------
 class TkinterwebRenderer:
     """
-    Renders HTML + CSS via a single tkinterweb.HtmlFrame.
+    Renders HTML via a single tkinterweb.HtmlFrame.
 
-    See module docstring for the full explanation of the temp-file strategy
-    that makes anchor navigation work correctly.
+    Responsibilities
+    ----------------
+    * Display content via ``load_html`` or ``load_url``.
+    * Intercept link clicks and route them appropriately.
+
+    File management is NOT a responsibility of this class.
+    ``TempHtmlStore`` (owned by ``DocumentViewer``) handles all temp files.
+    This renderer simply receives a ``file://`` URI and loads it.
     """
-
-    _TEMP_FILE: Path | None = None   # shared across all instances
 
     def __init__(
         self,
@@ -124,13 +105,6 @@ class TkinterwebRenderer:
         from tkinterweb import HtmlFrame
 
         self._on_navigate = on_navigate
-
-        # One shared temp file for the lifetime of the process
-        if TkinterwebRenderer._TEMP_FILE is None:
-            tmp = Path(tempfile.gettempdir()) / "mdviewer_render"
-            tmp.mkdir(parents=True, exist_ok=True)
-            TkinterwebRenderer._TEMP_FILE = tmp / "current.html"
-
         self._frame: tk.Widget = HtmlFrame(
             parent,
             messages_enabled=False,
@@ -141,37 +115,39 @@ class TkinterwebRenderer:
     # ------------------------------------------------------------------
     def load_html(self, html: str, base_url: str = "") -> None:
         """
-        Render *html*.
+        Render *html* from a string.
 
-        If *base_url* is provided, relative URLs in the HTML are first
-        rewritten to absolute ``file://`` URLs; then the processed HTML is
-        written to a temp file and loaded via ``load_url`` so tkinterweb has
-        a known current URL — which is required for ``#anchor`` navigation.
+        Use for content that does not require anchor navigation (welcome
+        screen, inline error pages).  For actual documents, prefer
+        ``load_url`` with a pre-written temp file so tkinterweb has a
+        stable current URL.
         """
-        if base_url:
-            html = _make_urls_absolute(html, base_url)
-
         try:
-            assert self._TEMP_FILE is not None
-            self._TEMP_FILE.write_text(html, encoding="utf-8")
-            self._frame.load_url(self._TEMP_FILE.as_uri())
-        except Exception:
-            # Fallback if temp file write fails (e.g. permission error)
-            try:
-                self._frame.load_html(html, base_url=base_url)
-            except TypeError:
-                self._frame.load_html(html)
+            self._frame.load_html(html, base_url=base_url)
+        except TypeError:
+            self._frame.load_html(html)
+
+    def load_url(self, url: str) -> None:
+        """
+        Load from *url* (typically a ``file://`` pointing to a temp file).
+
+        Because each tab has a unique URL, tkinterweb's cache is not an
+        issue — different URL, different content.  No ``force=True`` needed.
+        Anchor navigation works because tkinterweb has a stable current URL
+        to resolve ``#section`` against.
+        """
+        self._frame.load_url(url)
 
     def get_widget(self) -> tk.Widget:
         return self._frame
 
     # ------------------------------------------------------------------
     def _handle_link_click(self, url: str) -> None:
-        """Called by tkinterweb for every user link click."""
+        """Called by tkinterweb for every user-initiated link click."""
         if not url:
             return
 
-        # External → system browser
+        # External links → system browser
         if url.startswith(("http://", "https://")):
             webbrowser.open(url)
             return
@@ -180,15 +156,21 @@ class TkinterwebRenderer:
             local = _file_url_to_path(url)
             if local:
                 p = Path(local)
-                if not p.suffix:
-                    return   # bare directory path — suppress silently
 
+                # No extension = bare directory path.
+                # Arises from #anchor links resolved against a directory
+                # base_url (safety net; should not normally occur now that
+                # TempHtmlStore pre-processes HTML before writing).
+                if not p.suffix:
+                    return  # suppress silently
+
+                # Cross-file .md link → open as new tab
                 if p.suffix.lower() in (".md", ".markdown"):
                     if self._on_navigate:
                         self._on_navigate(local)
                     return
 
-            # .html anchor nav, images, CSS — let tkinterweb handle
+            # .html anchor navigation, images, CSS → delegate to frame
             self._frame.load_url(url)
             return
 
@@ -199,26 +181,44 @@ class TkinterwebRenderer:
 # Plain-text fallback adapter
 # ---------------------------------------------------------------------------
 class ScrolledTextRenderer:
-    """Plain-text fallback: strips HTML tags, displays raw text."""
+    """
+    Plain-text fallback for when tkinterweb is unavailable.
+
+    Strips HTML tags and displays the raw text.  ``load_url`` reads the
+    file at the given ``file://`` URI and falls back to ``load_html``.
+    """
 
     def __init__(
         self,
         parent: tk.Widget,
         on_navigate: Callable[[str], None] | None = None,
     ) -> None:
+        import re
         from tkinter.scrolledtext import ScrolledText
+
         self._re     = re
         self._widget = ScrolledText(parent, wrap=tk.WORD, font=("Courier New", 11))
 
     def load_html(self, html: str, base_url: str = "") -> None:
-        plain = self._re.sub(r"<[^>]+>", "", html)
-        self._widget.config(state=tk.NORMAL)
-        self._widget.delete("1.0", tk.END)
-        self._widget.insert(tk.END, plain)
-        self._widget.config(state=tk.DISABLED)
+        self._display(self._re.sub(r"<[^>]+>", "", html))
+
+    def load_url(self, url: str) -> None:
+        try:
+            local = _file_url_to_path(url)
+            if local:
+                html = Path(local).read_text(encoding="utf-8")
+                self.load_html(html)
+        except Exception:
+            pass
 
     def get_widget(self) -> tk.Widget:
         return self._widget
+
+    def _display(self, text: str) -> None:
+        self._widget.config(state=tk.NORMAL)
+        self._widget.delete("1.0", tk.END)
+        self._widget.insert(tk.END, text)
+        self._widget.config(state=tk.DISABLED)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ def make_renderer(
     Return the best available renderer for *parent*.
 
     *on_navigate* is called with a local filesystem path when the user
-    clicks a link to a ``.md`` file.
+    clicks a link to a ``.md`` file inside the rendered content.
     """
     try:
         return TkinterwebRenderer(parent, on_navigate=on_navigate)

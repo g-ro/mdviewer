@@ -77,7 +77,8 @@ mdviewer/
 ├── tests/
 │   ├── conftest.py         # Shared fixtures and sys.path setup
 │   ├── test_tab_model.py   # 33 tests for pure-Python tab state
-│   └── test_md_converter.py # 18 tests for Markdown conversion
+│   ├── test_md_converter.py # 18 tests for Markdown conversion
+│   └── test_temp_store.py  # 20 tests for TempHtmlStore lifecycle
 │
 └── src/
     ├── main.py             # Application entry point (used by PyInstaller)
@@ -95,7 +96,8 @@ mdviewer/
     │   ├── __init__.py
     │   ├── logging_config.py  # Lazy logger + global exception hooks
     │   ├── md_converter.py    # Markdown → HTML pipeline
-    │   └── renderer.py        # RendererProtocol + two adapters + factory
+    │   ├── renderer.py        # RendererProtocol + two adapters + factory
+    │   └── temp_store.py      # Per-tab temp HTML file lifecycle
     │
     └── views/
         ├── __init__.py
@@ -164,6 +166,10 @@ main.py
               │     └── utils/logging_config.py
               └── utils/renderer.py
                     └── utils/logging_config.py
+
+              utils/temp_store.py
+                    └── utils/logging_config.py
+                    └── utils/renderer.py  (_make_urls_absolute)
 
 config.py          (no app imports)
 version.py         (no app imports)
@@ -333,7 +339,56 @@ convert_md_string_to_html(md_content: str) -> str
 
 ---
 
-### 5.6 `src/utils/renderer.py`
+### 5.6 `src/utils/temp_store.py`
+
+Manages the lifecycle of per-tab temporary HTML files under `%TEMP%/mdviewer/`.
+This is the single class in the codebase with filesystem write responsibility
+for the rendering pipeline.
+
+**Why it exists:** tkinterweb requires a stable `file://` URL per document to
+support in-document anchor navigation and to avoid cache collisions when
+switching tabs. A single shared file (the earlier approach) caused both problems.
+`TempHtmlStore` solves them by giving each tab its own UUID-named file.
+
+**Public API:**
+
+| Method | Description |
+|---|---|
+| `write(key, html, base_url)` | Pre-process HTML (absolute URLs) and write to `<key>.html`; returns `Path` |
+| `uri_for(key)` | Return the `file://` URI for `key`'s file |
+| `release(key)` | Delete `key`'s file (called on tab close or demotion) |
+| `cleanup_all()` | Delete all `*.html` files; registered with `atexit` automatically |
+
+**Lifecycle mapping** (as called by `DocumentViewer`):
+
+```
+Tab opened / promoted   → write(tab_id, html, base_url)
+Tab selected            → uri_for(tab_id)   [read-only, no write]
+Tab closed / demoted    → release(tab_id)
+Process exits           → cleanup_all()     [via atexit]
+Startup                 → _sweep_stale()    [removes orphans > 24 h old]
+```
+
+**URL pre-processing (`_make_urls_absolute`):**
+Before writing, every relative `src`/`href` attribute is rewritten to an
+absolute `file://` URL using `urljoin(base_url, url)`. Anchor links (`#section`)
+are intentionally left unchanged so they resolve against the temp file's own
+URL, enabling in-document scroll navigation.
+
+```
+src="diagram.png"   →  src="file:///C:/docs/diagram.png"   (absolute ✓)
+href="other.md"     →  href="file:///C:/docs/other.md"     (absolute ✓)
+href="#section"     →  href="#section"                     (unchanged ✓)
+href="https://…"    →  href="https://…"                    (unchanged ✓)
+```
+
+**Multi-instance safety:** Files are named by UUID (`<tab_uuid>.html`), which
+is globally unique. Two simultaneous MDViewer windows never share or overwrite
+each other's files.
+
+---
+
+### 5.7 `src/utils/renderer.py`
 
 Defines the HTML rendering abstraction.
 
@@ -343,32 +398,45 @@ Defines the HTML rendering abstraction.
 @runtime_checkable
 class RendererProtocol(Protocol):
     def load_html(self, html: str, base_url: str = "") -> None: ...
+    def load_url(self, url: str) -> None: ...
     def get_widget(self) -> tk.Widget: ...
 ```
 
-Any object that implements these two methods is a valid renderer. `DocumentViewer`
-holds a `RendererProtocol` reference and calls only these two methods — it never
-imports `tkinterweb` directly.
+Two loading methods serve different purposes:
+
+- `load_html` — renders in-memory HTML directly (welcome screen, error pages).
+  No temp file is involved. Anchor navigation does not work with this method
+  because tkinterweb has no current URL to resolve `#section` against.
+- `load_url` — loads from a `file://` URI (the per-tab temp file). This is
+  used for all real documents. Anchor navigation works because tkinterweb has
+  a stable current URL.
+
+`DocumentViewer` holds a `RendererProtocol` reference and never imports
+`tkinterweb` directly.
 
 #### `TkinterwebRenderer`
 
-Wraps `tkinterweb.HtmlFrame`. Handles the API difference between older
-tkinterweb versions (where `load_html` does not accept `base_url`) via a
-`try/except TypeError` guard.
+Wraps `tkinterweb.HtmlFrame`. Intercepts link clicks via the `on_link_click`
+constructor parameter (not by monkey-patching `load_url` after construction —
+see Section 10.2 for why that fails). `load_url` delegates to
+`self._frame.load_url(url)` in a single line; no `force=True` is needed
+because each tab has a unique URL. File management is delegated entirely to
+`TempHtmlStore`.
 
 #### `ScrolledTextRenderer`
 
-Fallback when tkinterweb is unavailable. Strips HTML tags with a regex and
-displays the plain Markdown source in a `ScrolledText` widget.
+Fallback when tkinterweb is unavailable. `load_html` strips HTML tags.
+`load_url` reads the file at the given `file://` URI and falls back to
+`load_html`.
 
-#### `make_renderer(parent) -> RendererProtocol`
+#### `make_renderer(parent, on_navigate) -> RendererProtocol`
 
 Factory function. Returns a `TkinterwebRenderer` if the import succeeds,
-otherwise logs a warning and returns a `ScrolledTextRenderer`.
+otherwise a `ScrolledTextRenderer`.
 
 ---
 
-### 5.7 `src/views/file_explorer.py`
+### 5.8 `src/views/file_explorer.py`
 
 A lazy-loading directory tree displayed in the left panel.
 
@@ -398,16 +466,17 @@ _TAG_PLACEHOLDER = "placeholder"
 
 ---
 
-### 5.8 `src/views/document_viewer.py`
+### 5.9 `src/views/document_viewer.py`
 
-The most complex view. It coordinates three collaborators:
+The most complex view. It coordinates **four** collaborators:
 
 ```
 DocumentViewer
     │
-    ├── TabModel         (state)
+    ├── TabModel         (state — visible / overflow tiers)
     ├── _TabBar          (visual tab strip)
-    └── RendererProtocol (HTML output widget)
+    ├── RendererProtocol (HTML display widget)
+    └── TempHtmlStore    (per-tab temp file lifecycle)
 ```
 
 #### `_TabEntry` dataclass
@@ -449,7 +518,7 @@ error HTML to prevent broken output from paths containing `<` or `&`.
 
 ---
 
-### 5.9 `src/views/main_window.py`
+### 5.10 `src/views/main_window.py`
 
 The root window class. It:
 
@@ -462,7 +531,7 @@ The root window class. It:
 
 ---
 
-### 5.10 `src/main.py`
+### 5.11 `src/main.py`
 
 The application entry point used by PyInstaller.
 
@@ -622,45 +691,65 @@ DocumentViewer.open_file  (continued)
 │  │       <Enter>/<Leave> → _on_hover for all three widgets.
 │  └─ Calls _highlight(tab_id): sets active_id, recolours all tabs.
 │
-│  [views/document_viewer.py → utils/renderer.py]
+│  [views/document_viewer.py → utils/temp_store.py + utils/renderer.py]
 ▼
-DocumentViewer calls: self._renderer.load_html(html, base_url)
-│  self._renderer is a TkinterwebRenderer (RendererProtocol).
+DocumentViewer.open_file  (continued — writing and displaying)
 │
-│  [utils/renderer.py]
-▼
-TkinterwebRenderer.load_html(html, base_url)
+│  TempHtmlStore.write(tab_id, html, base_url)
+│  │  Calls _make_urls_absolute(html, base_url):
+│  │    Scans every src="…" and href="…" in the HTML.
+│  │    Anchors (#…), external URLs (http/https), data: URIs → unchanged.
+│  │    Relative paths (e.g. "image.png") →
+│  │        urljoin(base_url, "image.png")
+│  │        = "file:///path/to/dir/image.png"   (absolute)
+│  │  Writes processed HTML to:
+│  │    %TEMP%/mdviewer/<tab_uuid>.html
+│  │    Each tab has its own UUID-named file — stable, unique URL.
+│  │    No shared file; no force=True; no cache collision.
+│  └─ Returns the Path of the written file.
 │
-│  Step 1 — Rewrite relative URLs to absolute:
-│    _make_urls_absolute(html, base_url)
-│    │  Scans every src="…" and href="…" in the HTML.
-│    │  Anchors (#…), external URLs (http/https), data: URIs → unchanged.
-│    │  Relative paths (e.g. "image.png") →
-│    │      urljoin(base_url, "image.png")
-│    │      = "file:///path/to/dir/image.png"   (absolute)
-│    └─ Returns modified HTML string
+│  _TabBar.add(tab_id, "DEVELOPER-GUIDE.md")
+│  │  Creates tk.Frame (outer container) + tk.Label (title) +
+│  │  tk.Label (× close button).
+│  │  Binds <Button-1> → _on_select, <Button-2> → _on_close,
+│  │       <Enter>/<Leave> → _on_hover for all three widgets.
+│  └─ Calls _highlight(tab_id): sets active_id, recolours all tabs.
 │
-│  Step 2 — Write to temp file:
-│    TkinterwebRenderer._TEMP_FILE.write_text(html, encoding="utf-8")
-│    │  Path: %TEMP%/mdviewer_render/current.html
-│    │  Shared across all tabs (overwritten on every load_html call).
-│    │  Required so tkinterweb has a real current URL, which is
-│    │  necessary for in-document anchor navigation to work.
-│    └─ See § 10 for the full explanation of why this is needed.
-│
-│  Step 3 — Load via URL (not via string):
-│    self._frame.load_url(temp_file.as_uri())
-│    │  temp_file.as_uri() → "file:///C:/Users/…/mdviewer_render/current.html"
-│    │  This call goes directly to the original tkinterweb load_url,
-│    │  bypassing on_link_click (which is only for user click events).
-│    └─ tkinterweb reads the temp file, parses HTML/CSS, renders to screen.
+│  RendererProtocol.load_url(store.uri_for(tab_id))
+│  │  uri = "file:///C:/Users/…/AppData/Local/Temp/mdviewer/<tab_uuid>.html"
+│  │  Each tab has a unique URL → tkinterweb's cache is not an issue.
+│  └─ TkinterwebRenderer.load_url delegates directly to:
+│       self._frame.load_url(uri)
+│       tkinterweb reads the file, parses HTML/CSS, renders to screen.
 │
 ▼
 HtmlFrame renders the HTML to the tkinter canvas.
 Pixels appear on screen. ✓
 ```
 
-### 7.1 What happens when the user clicks a TOC anchor link
+### 7.1 What happens when the user switches to an existing tab
+
+```
+USER clicks a tab that is already visible
+│
+▼
+_TabBar fires on_select(tab_id)
+│
+▼
+DocumentViewer._select_visible(tab_id)
+│  _tab_bar.select(tab_id)  ← visual highlight only
+│
+│  self._renderer.load_url(self._temp_store.uri_for(tab_id))
+│  │  The URI is "file:///…/mdviewer/<this_tab_uuid>.html"
+│  │  Different from the previously loaded tab's URI.
+│  │  tkinterweb loads from the correct per-tab file.
+│  └─ No force=True needed — the URL itself is the cache key. ✓
+│
+▼
+Correct document appears. ✓
+```
+
+### 7.2 What happens when the user clicks a TOC anchor link
 
 After the document is on screen, clicking `<a href="#7-file-to-screen-full-call-stack">`
 triggers a second, shorter call chain:
@@ -674,34 +763,34 @@ tkinterweb detects the click and fires the on_link_click callback
 with the resolved URL.
 │
 │  Anchor "#section" resolved against current URL
-│  (file:///…/current.html) → "file:///…/current.html#section"
+│  (file:///…/mdviewer/<tab_uuid>.html) → "file:///…/mdviewer/<tab_uuid>.html#section"
 │
 │  [utils/renderer.py]
 ▼
 TkinterwebRenderer._handle_link_click(url)
-│  url = "file:///…/mdviewer_render/current.html#7-file-to-screen-…"
+│  url = "file:///…/mdviewer/<tab_uuid>.html#7-file-to-screen-…"
 │
 │  Not http/https → skip external-browser branch.
 │
 │  Starts with "file://" → parse local path:
 │    _file_url_to_path(url)
-│    │  urlparse strips the fragment: path = "…/current.html"
-│    └─ Returns "C:/…/mdviewer_render/current.html"
+│    │  urlparse strips the fragment: path = "…/mdviewer/<tab_uuid>.html"
+│    └─ Returns "C:/…/mdviewer/<tab_uuid>.html"
 │
-│  Path("…/current.html").suffix = ".html"
+│  Path("…/<tab_uuid>.html").suffix = ".html"
 │  Not empty  → not suppressed (bare dir check passes)
 │  Not .md    → not a cross-file link
 │
 │  Falls through to: self._frame.load_url(url)
-│  │  url still includes the fragment: "…/current.html#section"
-│  │  tkinterweb re-loads current.html (from OS cache, instant)
+│  │  url still includes the fragment: "…/<tab_uuid>.html#section"
+│  │  tkinterweb re-loads the tab's file (already warm in OS cache, instant)
 │  └─ Scrolls to the element with id="section". ✓
 │
 ▼
 Page scrolls to the target heading. No navigation, no "Oops".
 ```
 
-### 7.2 What happens when the user clicks an external link
+### 7.3 What happens when the user clicks an external link
 
 ```
 USER clicks <a href="https://github.com/g-ro/mdviewer">
@@ -949,90 +1038,138 @@ not the original document's directory. They would look for
 
 ---
 
-### 10.5 Final solution — temp file + pre-processed absolute URLs
+### 10.5 Interim solution — single shared temp file (and why it was not enough)
 
-**The insight:** decouple the two concerns:
-
-| Concern | Solution |
-|---|---|
-| Anchor navigation needs a current URL | Write to temp file, load via `load_url` |
-| Relative resources need original directory | Rewrite relative URLs to absolute *before* writing |
-
-**Step 1 — Pre-process:** `_make_urls_absolute(html, base_url)` scans every
-`src=` and `href=` attribute in the HTML and rewrites relative values to
-absolute `file://` URLs using `urljoin(base_url, url)`.
+With `on_link_click` correctly intercepted and a temp file loaded via `load_url`,
+anchor navigation worked. The interim implementation used a **single shared temp
+file** (`%TEMP%/mdviewer/current.html`) overwritten on every `load_html` call,
+patched with `force=True` to bypass tkinterweb's URL cache.
 
 ```python
-_ATTR_RE = re.compile(r'(src|href)\s*=\s*(["\'])([^"\']*?)\2', re.IGNORECASE)
-
-def _make_urls_absolute(html: str, base_url: str) -> str:
-    def _replace(m):
-        attr, quote, url = m.group(1), m.group(2), m.group(3)
-        if not url or url.startswith(("#", "http", "data:", "file://", "mailto:")):
-            return m.group(0)   # leave unchanged
-        return f'{attr}={quote}{urljoin(base_url, url)}{quote}'
-    return _ATTR_RE.sub(_replace, html)
-```
-
-Crucially, **anchor links (`#section`) are left unchanged** because they start
-with `#`. After this step:
-
-| Original | After |
-|---|---|
-| `src="diagram.png"` | `src="file:///C:/docs/diagram.png"` — absolute ✓ |
-| `href="other.md"` | `href="file:///C:/docs/other.md"` — absolute ✓ |
-| `href="#section"` | `href="#section"` — unchanged (resolved later) ✓ |
-| `href="https://…"` | `href="https://…"` — unchanged ✓ |
-
-**Step 2 — Write and load:**
-
-```python
+# Interim approach — shared file
 self._TEMP_FILE.write_text(html, encoding="utf-8")
-self._frame.load_url(self._TEMP_FILE.as_uri())
+self._frame.load_url(self._TEMP_FILE.as_uri(), force=True)
 ```
 
-**Step 3 — Anchor click routing:**
-
-When the user clicks `#section`, tkinterweb resolves it against the temp
-file's URI → `file:///…/current.html#section`. Our handler sees:
-
-- Extension = `.html` → not suppressed, not `.md`
-- Falls through to `self._frame.load_url(url)`
-- tkinterweb reloads the temp file (from OS cache, instant) + scrolls ✓
-
-**Complete URL routing table (final):**
-
-```
-file:///…/current.html#section  →  .html ext  →  load_url  →  scroll ✓
-file:///C:/docs/other.md        →  .md ext    →  on_navigate → new tab ✓
-file:///C:/docs/img.png         →  .png ext   →  load_url  →  image loads ✓
-file:///C:/docs/                →  no ext     →  suppressed  →  no-op ✓
-https://example.com             →  http*      →  browser ✓
-```
+This worked for single-document browsing but introduced new problems:
 
 ---
 
-### 10.6 Lessons for future changes to `renderer.py`
+### 10.6 Problem 4 — Tab-switching showed the wrong document
+
+**Symptom:** After opening documents from two different folders, clicking any
+tab always displayed the last-opened document. All tabs showed identical
+content.
+
+**Root cause:** `load_url` in tkinterweb performs a URL-equality check:
+
+```python
+# Inside tkinterweb.HtmlFrame.load_url:
+if not self._current_url == url:
+    self._previous_url = self._current_url
+```
+
+When `force=False` (the default), tkinterweb serves the **in-memory cached
+version** of the page if the URL matches the current URL. Since all tabs
+shared the same URL (`file:///…/current.html`), switching tabs wrote new HTML
+to the file and called `load_url` with the same path — tkinterweb saw the URL
+hadn't changed and served the cached (wrong) content.
+
+**Interim fix:** `force=True` told tkinterweb to discard its cache and re-read
+the file from disk. This fixed the display bug but introduced a new issue:
+`force=True` also forces all referenced resources (CSS, images) to reload on
+every tab switch — unnecessary overhead.
+
+**Root cause of root cause:** One URL for many documents is a design flaw.
+The URL is supposed to identify content stably. A shared, overwritten file
+violates that contract.
+
+---
+
+### 10.7 Final solution — per-tab temp files (`TempHtmlStore`)
+
+**The insight:** give each tab its own stable, unique URL. Since tab IDs are
+already UUID4 strings, naming each temp file `<tab_uuid>.html` provides
+uniqueness for free.
+
+**`TempHtmlStore`** (`src/utils/temp_store.py`) is a dedicated class that
+owns the `%TEMP%/mdviewer/` directory and manages the complete file lifecycle.
+
+```python
+# On tab open / promote:
+self._temp_store.write(tab_id, html, base_url)   # writes <tab_uuid>.html
+self._renderer.load_url(self._temp_store.uri_for(tab_id))
+
+# On tab switch:
+self._renderer.load_url(self._temp_store.uri_for(tab_id))
+# Different UUID → different URL → no cache conflict. No force=True needed.
+
+# On tab close / demotion:
+self._temp_store.release(tab_id)   # deletes <tab_uuid>.html
+```
+
+URL pre-processing (`_make_urls_absolute`) moved from `TkinterwebRenderer`
+into `TempHtmlStore.write` — it is a file-preparation step, not a rendering
+step.
+
+**Complete URL routing table (current):**
+
+```
+file:///…/mdviewer/<uuid>.html#section  →  .html ext  →  load_url → scroll ✓
+file:///C:/docs/other.md                →  .md ext    →  on_navigate → new tab ✓
+file:///C:/docs/img.png                 →  .png ext   →  load_url → image ✓
+file:///C:/docs/                        →  no ext     →  suppressed → no-op ✓
+https://example.com                     →  http*      →  browser ✓
+```
+
+**Lifecycle of a temp file:**
+
+```
+Tab opened            →  %TEMP%/mdviewer/<uuid>.html  created
+Tab switched away     →  file stays (still visible tier)
+Tab demoted           →  file deleted (no longer rendered)
+Tab promoted back     →  new file written (HTML re-rendered from disk)
+Tab closed            →  file deleted
+Process exits         →  all files deleted (atexit)
+Startup               →  files > 24 h swept (crash orphan cleanup)
+```
+
+**Properties of the design:**
+
+| Property | Detail |
+|---|---|
+| No `force=True` | Different URL per tab → cache never conflicts |
+| Multi-instance safe | UUIDs are globally unique; two MDViewer windows never conflict |
+| Max disk usage | `MAX_TABS` files at once (≤ 5 × ~50 KB ≈ 250 KB) |
+| Renderer is file-ignorant | `TkinterwebRenderer` does not know about temp files; it just receives a URI |
+| Testable without tkinter | `TempHtmlStore` has no UI dependency; 20 tests run in plain pytest |
+
+---
+
+### 10.8 Lessons for developers touching `renderer.py` or `temp_store.py`
 
 1. **Never intercept by wrapping `load_url` after construction.** The
    `on_link_click` callback is stored at construction time. Use the
-   constructor parameter.
+   `on_link_click` constructor parameter.
 
-2. **Never use `load_html()` when anchor navigation must work.** Always
-   write to the temp file and use `load_url()`.
+2. **Never use `load_html()` for documents.** Use `TempHtmlStore.write` +
+   `renderer.load_url`. `load_html` is reserved for the welcome screen and
+   error pages where anchor navigation is not needed.
 
-3. **Pre-process relative URLs before writing to temp file.** The temp file
-   lives in a different directory from the original; relative paths will
-   resolve wrongly without `_make_urls_absolute`.
+3. **Never use a single shared temp file.** Cache collisions are silent and
+   hard to diagnose. One file per tab, named by UUID.
 
-4. **Identify no-extension `file://` paths as safe-to-suppress.** They
-   arise from the markdown `toc` extension generating `#anchor` links that
-   get resolved against a `base_url` pointing to a directory. No file at that
-   path exists; suppressing silently is correct.
+4. **Pre-process relative URLs inside `TempHtmlStore.write`.** The temp file
+   lives in a different directory from the original; relative paths must be
+   made absolute before writing.
 
-5. **Do not change `_TEMP_FILE` to be per-tab.** It is intentionally shared:
-   there is only one `HtmlFrame` instance, and it always shows exactly one
-   document. Per-tab temp files would consume disk space unnecessarily.
+5. **Identify no-extension `file://` paths as safe-to-suppress.** They arise
+   from the `toc` extension generating `#anchor` links resolved against a
+   directory `base_url`. Suppressing silently is correct.
+
+6. **`release(tab_id)` must be called at every visibility transition.** The
+   lifecycle rule: visible ↔ temp file exists; non-visible ↔ no temp file.
+   Missing a `release` call leaks disk space.
 
 ---
 
@@ -1079,7 +1216,7 @@ To add a Markdown extension (e.g. `pymdownx.superfences`), append it to
 
 ## 12. Extending the Application
 
-### 10.1 Adding a new HTML renderer backend
+### 12.1 Adding a new HTML renderer backend
 
 1. Create a class that implements `RendererProtocol`:
 
@@ -1114,7 +1251,7 @@ def make_renderer(parent: tk.Widget) -> RendererProtocol:
 
 No other files need to change.
 
-### 10.2 Adding a new panel to the main window
+### 12.2 Adding a new panel to the main window
 
 1. Create a new `ttk.Frame` subclass in `src/views/`.
 2. In `MainWindow.__init__`, add it to the `ttk.PanedWindow`:
@@ -1128,7 +1265,7 @@ paned.add(self.my_panel, weight=1)
    construction time, following the same pattern as `on_file_open` in
    `FileExplorer` and `on_status_update` in `DocumentViewer`.
 
-### 10.3 Changing the Markdown theme
+### 12.3 Changing the Markdown theme
 
 Replace `src/resources/github.css` with any CSS you like. No code changes
 are required. The new CSS is picked up on next launch (or next call to
@@ -1141,7 +1278,7 @@ import utils.md_converter as mc
 mc._css_cache = None   # next conversion will re-read the file
 ```
 
-### 10.4 Adding a new configuration field
+### 12.4 Adding a new configuration field
 
 Add a field to `AppConfig` in `src/config.py`:
 
@@ -1155,7 +1292,7 @@ class AppConfig:
 The field is immediately available as `cfg.show_line_numbers` everywhere
 `from config import cfg` is in scope. No registration or plumbing needed.
 
-### 10.5 Implementing undo / redo
+### 12.5 Implementing undo / redo
 
 The `TabModel` mutation methods already return the information needed to
 reverse an operation (demoted `tab_id`, auto-promote candidate). A Command
@@ -1179,7 +1316,7 @@ class CommandHistory:
 
 ## 13. Testing
 
-### 11.1 Running tests
+### 13.1 Running tests
 
 ```bash
 # Install test dependencies
@@ -1195,7 +1332,7 @@ uv run --group test pytest tests/ -v
 uv run --group test pytest tests/test_tab_model.py::TestPromote -v
 ```
 
-### 11.2 Test structure
+### 13.2 Test structure
 
 ```
 tests/
@@ -1210,17 +1347,23 @@ tests/
 │     TestCloseOverflow         single close, close-all, empty guard
 │     TestUpdateVisibleHtml     refresh in-place
 │
-└── test_md_converter.py       (18 tests)
-      TestHtmlStructure         DOCTYPE, head/body, CSS, charset
-      TestUtf8Conversion        headings, bold, italic, Path/str equivalence
-      TestLatin1Fallback        graceful recovery, content decoded
-      TestExtensions            tables, fenced code
-      TestConvertString         string API, complete document, empty input
-      TestErrorCases            FileNotFoundError propagation
-      TestCachedInstanceReset   no state bleed between calls, idempotent
+├── test_md_converter.py       (18 tests)
+│     TestHtmlStructure         DOCTYPE, head/body, CSS, charset
+│     TestUtf8Conversion        headings, bold, italic, Path/str equivalence
+│     TestLatin1Fallback        graceful recovery, content decoded
+│     TestExtensions            tables, fenced code
+│     TestConvertString         string API, complete document, empty input
+│     TestErrorCases            FileNotFoundError propagation
+│     TestCachedInstanceReset   no state bleed between calls, idempotent
+│
+└── test_temp_store.py         (20 tests, 0 tkinter dependency)
+      TestWriteAndRelease        create, overwrite, uri_for, release, independence
+      TestCleanupAll             removes html files, preserves non-html, empty safe
+      TestMakeUrlsAbsolute       relative, anchor, external, data:, already-absolute,
+                                 single-quote attrs, write-with/without base_url
 ```
 
-### 11.3 What is NOT currently tested
+### 13.3 What is NOT currently tested
 
 | Area | Reason | How to test it |
 |---|---|---|
@@ -1229,7 +1372,7 @@ tests/
 | `_TabBar` | Widget creation needs Tk | Same as above |
 | `make_renderer` | ImportError branch | Mock `tkinterweb` with `unittest.mock` |
 
-### 11.4 Adding a new test
+### 13.4 Adding a new test
 
 1. Create `tests/test_<module>.py`.
 2. Add `sys.path` is already configured by `conftest.py` — no extra setup needed.
@@ -1247,7 +1390,7 @@ from utils.md_converter import convert_md_to_html
 
 ## 14. Building the Executable
 
-### 12.1 Prerequisites
+### 14.1 Prerequisites
 
 ```bash
 uv sync --group build
@@ -1255,7 +1398,7 @@ uv sync --group build
 
 This installs `PyInstaller` into the virtualenv.
 
-### 12.2 Running the build
+### 14.2 Running the build
 
 ```bash
 uv run --group build python build_exe.py
@@ -1263,7 +1406,7 @@ uv run --group build python build_exe.py
 
 Output: `dist/MDViewer.exe` — a self-contained single-file executable.
 
-### 12.3 How the build script works
+### 14.3 How the build script works
 
 `build_exe.py` invokes `PyInstaller.__main__.run()` directly (no subprocess).
 Key arguments:
@@ -1277,7 +1420,7 @@ Key arguments:
 | `--hidden-import=...` | Belt-and-suspenders declarations for all app modules |
 | `--onefile --windowed` | Single executable, no console window |
 
-### 12.4 Adding a custom icon
+### 14.4 Adding a custom icon
 
 Place `mdviewer.ico` in the `resources/` directory (the one at the project
 root, not `src/resources/`). The build script checks for it automatically:
@@ -1287,7 +1430,7 @@ icon_path = os.path.join(script_dir, "resources", "mdviewer.ico")
 icon_args = [f"--icon={icon_path}"] if os.path.exists(icon_path) else []
 ```
 
-### 12.5 Debugging a failed build
+### 14.5 Debugging a failed build
 
 The most common failure mode is `ModuleNotFoundError` at runtime. Check:
 
@@ -1299,7 +1442,7 @@ The most common failure mode is `ModuleNotFoundError` at runtime. Check:
 
 ## 15. Development Workflow
 
-### 13.1 Initial setup
+### 15.1 Initial setup
 
 ```bash
 git clone git@github.com:g-ro/mdviewer.git
@@ -1309,7 +1452,7 @@ uv sync --group test   # also installs pytest
 uv sync --group build  # also installs PyInstaller
 ```
 
-### 13.2 Running in development
+### 15.2 Running in development
 
 ```bash
 uv run python main.py
@@ -1325,7 +1468,7 @@ Alternatively, run the entry point directly:
 uv run python src/main.py
 ```
 
-### 13.3 Making changes to the tab model
+### 15.3 Making changes to the tab model
 
 `TabModel` has no UI dependency. Make your change, run the tests:
 
@@ -1336,13 +1479,13 @@ uv run --group test pytest tests/test_tab_model.py -v
 If the logic change affects the UI (e.g. a new return value from a mutation
 method), update the corresponding handler in `DocumentViewer` accordingly.
 
-### 13.4 Making changes to the CSS theme
+### 15.4 Making changes to the CSS theme
 
 Edit `src/resources/github.css`. Restart the application — the CSS file is
 read on the first conversion call and cached. Alternatively call
 `mc._css_cache = None` in a Python REPL attached to the running process.
 
-### 13.5 Changing the tab cap
+### 15.5 Changing the tab cap
 
 Edit `MAX_TABS` in `src/config.py`:
 

@@ -53,6 +53,7 @@ def build_exe() -> None:
         "--hidden-import=utils.logging_config",
         "--hidden-import=utils.md_converter",
         "--hidden-import=utils.renderer",
+        "--hidden-import=utils.temp_store",
 
         # ── tkinter ────────────────────────────────────────────────────
         "--hidden-import=tkinter",
