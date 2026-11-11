@@ -80,6 +80,8 @@ class MainWindow:
         file_menu.add_command(label="Open File…      Ctrl+O", command=self._open_file_dialog)
         file_menu.add_command(label="Open Folder…",          command=self._open_folder_dialog)
         file_menu.add_separator()
+        file_menu.add_command(label="Find…            Ctrl+F", command=self.viewer.open_search)
+        file_menu.add_separator()
         file_menu.add_command(label="Close Tab        Ctrl+W", command=self.viewer.close_current_tab)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
@@ -95,6 +97,7 @@ class MainWindow:
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self._open_file_dialog())
+        self.root.bind("<Control-f>", lambda _e: self.viewer.open_search())
         self.root.bind("<Control-w>", lambda _e: self.viewer.close_current_tab())
         self.root.bind("<Control-r>", lambda _e: self.viewer.refresh_current_tab())
 

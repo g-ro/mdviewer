@@ -18,12 +18,13 @@
 8. [Data Flow Walkthrough](#8-data-flow-walkthrough)
 9. [The Tab Lifecycle](#9-the-tab-lifecycle)
 10. [HTML Rendering: Problems and Solutions](#10-html-rendering-problems-and-solutions)
-11. [Configuration Reference](#11-configuration-reference)
-12. [Extending the Application](#12-extending-the-application)
-13. [Testing](#13-testing)
-14. [Building the Executable](#14-building-the-executable)
-15. [Development Workflow](#15-development-workflow)
-16. [Known Constraints](#16-known-constraints)
+11. [Find in Document](#11-find-in-document)
+12. [Configuration Reference](#12-configuration-reference)
+13. [Extending the Application](#13-extending-the-application)
+14. [Testing](#14-testing)
+15. [Building the Executable](#15-building-the-executable)
+16. [Development Workflow](#16-development-workflow)
+17. [Known Constraints](#17-known-constraints)
 
 ---
 
@@ -78,6 +79,7 @@ mdviewer/
 │   ├── conftest.py         # Shared fixtures and sys.path setup
 │   ├── test_tab_model.py   # 33 tests for pure-Python tab state
 │   ├── test_md_converter.py # 18 tests for Markdown conversion
+│   ├── test_search_state.py # 19 tests for _SearchState navigation model
 │   └── test_temp_store.py  # 20 tests for TempHtmlStore lifecycle
 │
 └── src/
@@ -103,7 +105,8 @@ mdviewer/
         ├── __init__.py
         ├── main_window.py     # Root window, menu, keyboard shortcuts
         ├── file_explorer.py   # Left-panel lazy directory tree
-        └── document_viewer.py # Tabbed viewer: _TabBar + DocumentViewer
+        ├── search_bar.py      # Modeless find dialog (SearchBar)
+        └── document_viewer.py # Tabbed viewer: _TabBar + DocumentViewer + search
 ```
 
 ---
@@ -164,8 +167,12 @@ main.py
               ├── utils/md_converter.py
               │     ├── config.py
               │     └── utils/logging_config.py
-              └── utils/renderer.py
-                    └── utils/logging_config.py
+              ├── utils/renderer.py
+              │     └── utils/logging_config.py
+              ├── utils/temp_store.py
+              │     ├── utils/logging_config.py
+              │     └── utils/renderer.py  (_make_urls_absolute)
+              └── views/search_bar.py   (lazy import — avoids circular dep at load)
 
               utils/temp_store.py
                     └── utils/logging_config.py
@@ -399,17 +406,24 @@ Defines the HTML rendering abstraction.
 class RendererProtocol(Protocol):
     def load_html(self, html: str, base_url: str = "") -> None: ...
     def load_url(self, url: str) -> None: ...
+    def find_text(self, term: str, index: int = 1,
+                  ignore_case: bool = True) -> int: ...
+    def clear_find(self) -> None: ...
     def get_widget(self) -> tk.Widget: ...
 ```
 
-Two loading methods serve different purposes:
+Four concerns are separated:
 
-- `load_html` — renders in-memory HTML directly (welcome screen, error pages).
-  No temp file is involved. Anchor navigation does not work with this method
-  because tkinterweb has no current URL to resolve `#section` against.
-- `load_url` — loads from a `file://` URI (the per-tab temp file). This is
-  used for all real documents. Anchor navigation works because tkinterweb has
-  a stable current URL.
+- `load_html` — render in-memory HTML (welcome screen, error pages).
+- `load_url` — load from a `file://` URI (per-tab temp file); enables anchor navigation.
+- `find_text` — highlight all matches, scroll to the `index`-th; returns total count.
+  Delegates to tkinterweb's native `HtmlFrame.find_text()` which searches rendered text
+  (not raw HTML), so HTML entities and cross-tag text work correctly.
+- `clear_find` — remove all search highlights (`find_text("")`).
+
+Highlight colours are configured once at `HtmlFrame` construction time from `cfg`:
+- `cfg.find_match_color` / `cfg.find_match_text_color` — all matches (yellow)
+- `cfg.find_current_color` / `cfg.find_current_text_color` — the active match (amber)
 
 `DocumentViewer` holds a `RendererProtocol` reference and never imports
 `tkinterweb` directly.
@@ -417,17 +431,15 @@ Two loading methods serve different purposes:
 #### `TkinterwebRenderer`
 
 Wraps `tkinterweb.HtmlFrame`. Intercepts link clicks via the `on_link_click`
-constructor parameter (not by monkey-patching `load_url` after construction —
-see Section 10.2 for why that fails). `load_url` delegates to
-`self._frame.load_url(url)` in a single line; no `force=True` is needed
-because each tab has a unique URL. File management is delegated entirely to
-`TempHtmlStore`.
+constructor parameter. `load_url` delegates to `self._frame.load_url(url)`;
+`find_text` delegates to `self._frame.find_text(...)`. File management is
+entirely delegated to `TempHtmlStore`.
 
 #### `ScrolledTextRenderer`
 
 Fallback when tkinterweb is unavailable. `load_html` strips HTML tags.
-`load_url` reads the file at the given `file://` URI and falls back to
-`load_html`.
+`load_url` reads the temp file and calls `load_html`. `find_text` returns `0`
+(stub); `clear_find` is a no-op.
 
 #### `make_renderer(parent, on_navigate) -> RendererProtocol`
 
@@ -468,7 +480,7 @@ _TAG_PLACEHOLDER = "placeholder"
 
 ### 5.9 `src/views/document_viewer.py`
 
-The most complex view. It coordinates **four** collaborators:
+The most complex view. It coordinates **five** collaborators:
 
 ```
 DocumentViewer
@@ -476,7 +488,8 @@ DocumentViewer
     ├── TabModel         (state — visible / overflow tiers)
     ├── _TabBar          (visual tab strip)
     ├── RendererProtocol (HTML display widget)
-    └── TempHtmlStore    (per-tab temp file lifecycle)
+    ├── TempHtmlStore    (per-tab temp file lifecycle)
+    └── SearchBar        (modeless find dialog — lazy import)
 ```
 
 #### `_TabEntry` dataclass
@@ -495,30 +508,91 @@ class _TabEntry:
     close:  tk.Label
 ```
 
+#### `_SearchState` dataclass
+
+Tracks an in-progress find session. Pure Python — no tkinter dependency —
+so the navigation logic is fully unit-testable.
+
+```python
+@dataclass
+class _SearchState:
+    term:        str
+    ignore_case: bool
+    match_count: int   # 0 = no results
+    current:     int   # 1-based; matches tkinterweb's select parameter
+```
+
+`advance()` / `retreat()` perform wrap-around navigation and return `True`
+when wrapping occurs (used to trigger the wrap-around status message).
+`status_text` returns `"3 of 12"` or `"No results for 'term'"`.
+
 #### `_TabBar`
 
-Owns only the visual representation of currently-visible tabs. It has no
-knowledge of file paths, HTML content, or overflow state. Its public interface
-is exactly three methods: `add(tab_id, title)`, `select(tab_id)`, and
-`remove(tab_id) -> str | None` (returns the successor tab_id).
-
-Hover effects are wired in `_on_hover(tab_id, entering)`. The active tab never
-changes colour on hover — only inactive tabs use `cfg.tab_color_hover`.
+Owns only the visual representation of currently-visible tabs. Its public
+interface is `add(tab_id, title)`, `select(tab_id)`, and
+`remove(tab_id) -> str | None`.
 
 #### `DocumentViewer`
 
-Receives `on_status_update: Callable[[str], None] | None` via its constructor.
-This avoids post-construction attribute injection, making the dependency
-explicit and preventing silent failures when a tab is evicted before the
-parent window has set up the callback.
+Receives `on_status_update` via the constructor (not post-hoc injection).
+Owns `_search_state: _SearchState | None` and `_search_bar: SearchBar | None`.
+`SearchBar` is imported lazily inside `open_search()` to avoid a circular
+import at module load time.
 
-The `_render_file` method wraps `convert_md_to_html` and catches all exceptions.
-Error messages are passed through `html.escape()` before being embedded in the
-error HTML to prevent broken output from paths containing `<` or `&`.
+**Search coordination methods:**
+
+| Method | Called by | Purpose |
+|---|---|---|
+| `open_search()` | Ctrl+F / menu | Create or re-focus `SearchBar` |
+| `_on_search(term, case)` | Search button / Enter | Call `renderer.find_text()`, update `_SearchState` |
+| `_on_search_next()` | ▶ button / F3 | `state.advance()`, call `renderer.find_text()` |
+| `_on_search_previous()` | ◀ button / Shift+F3 | `state.retreat()`, call `renderer.find_text()` |
+| `_on_search_close()` | ✕ / Escape | `renderer.clear_find()`, destroy dialog |
+| `_clear_search_state()` | Tab switch / refresh | Clear highlights, reset state; keep dialog open |
 
 ---
 
-### 5.10 `src/views/main_window.py`
+### 5.10 `src/views/search_bar.py`
+
+Modeless find dialog — a small `tk.Toplevel` that owns its own UI and nothing
+else.  It is intentionally dumb: every user action is forwarded via injected
+callbacks; it holds no search state and knows nothing about documents.
+
+**Layout (two rows):**
+```
+┌─────────────────────────────────────────────────────┐
+│  🔍  [_________________________]  Search  ◀  ▶  ✕  │
+│       □ Match case     3 of 12 matches               │
+└─────────────────────────────────────────────────────┘
+```
+
+**Public interface:**
+
+| Method | Description |
+|---|---|
+| `focus_entry()` | Focus the text entry and select its text |
+| `set_status(text, color)` | Update the match-count / message label |
+| `get_term()` | Return current entry text |
+| `is_case_sensitive()` | Return the Match-case checkbox state |
+
+**Keyboard shortcuts wired inside `SearchBar`:**
+
+| Key | Action |
+|---|---|
+| Enter / KP_Enter | Trigger search |
+| Escape | Close dialog |
+| F3 | Next match |
+| Shift+F3 | Previous match |
+| Ctrl+G | Next match |
+| Ctrl+Shift+G | Previous match |
+
+Positioned at the top-right corner of the parent window via
+`_position(parent)`. Declared `transient(parent)` to stay above the main
+window without being modal.
+
+---
+
+### 5.11 `src/views/main_window.py`
 
 The root window class. It:
 
@@ -526,12 +600,12 @@ The root window class. It:
   `FileExplorer` and `DocumentViewer`.
 - Creates `_status_var` **before** constructing `DocumentViewer` so the lambda
   passed as `on_status_update` is always safe to call.
-- Wires `Ctrl+O`, `Ctrl+W`, and `Ctrl+R` keyboard shortcuts at the root level
-  (not per-widget) so they work regardless of which widget has focus.
+- Wires `Ctrl+O`, `Ctrl+F`, `Ctrl+W`, and `Ctrl+R` keyboard shortcuts at the
+  root level (not per-widget) so they work regardless of which widget has focus.
 
 ---
 
-### 5.11 `src/main.py`
+### 5.12 `src/main.py`
 
 The application entry point used by PyInstaller.
 
@@ -800,6 +874,109 @@ TkinterwebRenderer._handle_link_click("https://github.com/g-ro/mdviewer")
 │  Starts with "https://" → webbrowser.open(url)
 └─ System default browser opens the URL.
    tkinterweb never navigates. Page stays on screen. ✓
+```
+
+---
+
+### 7.4 What happens when the user searches (Ctrl+F)
+
+```
+USER presses Ctrl+F
+│
+│  [views/main_window.py]
+▼
+MainWindow keyboard binding → viewer.open_search()
+│
+│  [views/document_viewer.py]
+▼
+DocumentViewer.open_search()
+│  Checks self._search_bar — if alive, refocuses it and returns early.
+│  Otherwise: lazy-imports SearchBar to avoid circular dependency.
+│  Creates SearchBar(parent=root, on_search=..., on_next=..., ...)
+│  Calls search_bar.focus_entry()
+│
+│  [views/search_bar.py]
+▼
+SearchBar.__init__()
+│  Builds two-row dialog: 🔍 entry + Search/◀/▶/✕ buttons + status label.
+│  Positions itself at top-right of parent window via _position(parent).
+│  Declared transient(parent) → stays above main window, non-blocking.
+│
+▼
+Dialog appears. User types search term, presses Enter.
+│
+│  [views/search_bar.py]
+▼
+SearchBar._trigger_search()
+│  Reads term from entry, validates (non-empty).
+│  Calls self._on_search(term, case_sensitive) → DocumentViewer._on_search
+│
+│  [views/document_viewer.py]
+▼
+DocumentViewer._on_search(term, case_sensitive)
+│  ignore_case = not case_sensitive
+│
+│  [utils/renderer.py → tkinterweb internals]
+▼
+TkinterwebRenderer.find_text(term, index=1, ignore_case)
+│  self._frame.find_text(term, select=1, ignore_case=ignore_case,
+│                        highlight_all=True)
+│  │  tkinterweb searches the RENDERED TEXT (not raw HTML).
+│  │  Highlights all matches with cfg.find_match_color (#ffeb3b).
+│  │  Highlights match 1 with cfg.find_current_color (#ff9800).
+│  │  Scrolls the viewport to match 1.
+│  └─ Returns total match count (e.g. 7)
+│
+│  [views/document_viewer.py]
+▼
+DocumentViewer._on_search  (continued)
+│  Creates _SearchState(term, ignore_case, match_count=7, current=1)
+│  If match_count > 0:
+│    search_bar.set_status("1 of 7", "#1a7f1a")   ← green
+│  Else:
+│    search_bar.set_status("No results for 'term'", "#cc0000")  ← red
+│
+▼
+Document shows all matches highlighted. First match is amber. ✓
+```
+
+---
+
+### 7.5 What happens on Next / Previous navigation
+
+```
+USER clicks ▶ Next  (or presses F3)
+│
+│  [views/search_bar.py]
+▼
+SearchBar fires self._on_next() → DocumentViewer._on_search_next()
+│
+│  [views/document_viewer.py]
+▼
+DocumentViewer._on_search_next()
+│  _search_state.advance()
+│  │  current = (current % match_count) + 1   ← wrap 7 → 1
+│  └─ Returns True if wrapped, False otherwise.
+│
+│  renderer.find_text(term, index=new_current, ignore_case)
+│  │  tkinterweb scrolls to the new current match.
+│  │  New match turns amber; old match reverts to yellow.
+│  └─ (match_count returned but not needed here)
+│
+│  _update_search_ui(wrapped, forward=True)
+│  │  search_bar.set_status("5 of 7", "#1a7f1a")
+│  │  If wrapped:
+│  │    search_bar.set_status(
+│  │        "🔍 Reached end — wrapped to beginning", "#cc6600"
+│  │    )
+│  └─  _notify("🔍 Reached end — wrapped to beginning")
+│         → self._on_status_update(msg)
+│         → MainWindow status bar shows message
+│
+▼
+Viewport scrolls to next match. Status label updated. ✓
+
+(Previous / ◀ follows the same path using retreat() instead of advance().)
 ```
 
 ---
@@ -1173,7 +1350,134 @@ Startup               →  files > 24 h swept (crash orphan cleanup)
 
 ---
 
-## 11. Configuration Reference
+## 11. Find in Document
+
+### 11.1 Overview
+
+MDViewer's find feature is built on tkinterweb's native `HtmlFrame.find_text()` API
+rather than custom HTML injection. This means:
+
+- Searches the **rendered text**, not raw HTML — HTML entities, cross-tag text, and
+  markdown-generated spans are all handled transparently.
+- All matches and the active match use **separate configurable highlight colours**
+  (yellow and amber by default) with zero extra code.
+- Navigation is a single API call per step — no HTML rewriting, no temp file updates.
+
+---
+
+### 11.2 Component map
+
+```
+Ctrl+F / File→Find
+      │
+      ▼
+MainWindow  ─────────────────────────────────────────────────────────────────┐
+      │  calls viewer.open_search()                                           │
+      ▼                                                                       │
+DocumentViewer                           SearchBar (Toplevel, modeless)       │
+  _search_state: _SearchState | None ◄──── on_search  ◄── Search button      │
+  _search_bar:   SearchBar | None         on_next     ◄── ▶ / F3             │
+      │                                   on_previous ◄── ◀ / Shift+F3       │
+      │  renderer.find_text(term, idx)     on_close    ◄── ✕ / Escape        │
+      ▼                                                                       │
+TkinterwebRenderer                                                            │
+  frame.find_text(...)   ← one tkinterweb call per search / navigation        │
+      │                                                                       │
+      ▼                                                                       │
+HtmlFrame (tkhtml3)                                                           │
+  highlights all matches (#ffeb3b)                                            │
+  highlights current match (#ff9800)                                          │
+  scrolls to selected match                                                   │
+  returns total match count ─────────────────────────────────────────────────┘
+```
+
+---
+
+### 11.3 `_SearchState` — navigation model
+
+The entire navigation state is held in a single dataclass, completely decoupled
+from tkinter:
+
+```python
+@dataclass
+class _SearchState:
+    term:        str
+    ignore_case: bool
+    match_count: int   # 0 = no results
+    current:     int   # 1-based; directly maps to tkinterweb's select= param
+```
+
+The `current` index is 1-based because tkinterweb's `find_text(select=N)` is 1-based.
+Keeping them identical avoids an off-by-one translation layer.
+
+**Navigation arithmetic:**
+
+```python
+# Next  (wraps 7 → 1)
+self.current = (self.current % self.match_count) + 1
+
+# Previous  (wraps 1 → 7)
+self.current = ((self.current - 2) % self.match_count) + 1
+```
+
+Both methods return `True` when wrapping occurs so the caller can display the
+appropriate "reached end / beginning" message.
+
+---
+
+### 11.4 Search lifecycle and tab interactions
+
+| Event | Action |
+|---|---|
+| Search performed | `_SearchState` created; `renderer.find_text(term, 1)` |
+| Next / Previous | `state.advance()` / `state.retreat()`; `renderer.find_text(term, state.current)` |
+| Wrap detected | Dialog status turns orange; main status bar notified |
+| Tab switched | `renderer.clear_find()` on departing tab; `_search_state = None`; dialog stays open, status cleared |
+| Tab refreshed | Same as tab switch — highlights cleared, state reset |
+| Dialog closed (✕/Esc) | `renderer.clear_find()`; `_search_state = None`; dialog destroyed |
+| No document open | Dialog shows "No document open" in grey |
+| No matches | Dialog shows "No results for 'term'" in red |
+
+**Why search clears on tab switch:** tkinterweb's highlight state belongs to the
+currently-loaded document. Switching loads a different temp file; the previous
+highlights are gone. Rather than re-running the search silently (which could
+confuse the user), the state is cleared and the dialog stays open so the user
+can search again in the new context.
+
+---
+
+### 11.5 `SearchBar` — UI contract
+
+`SearchBar` is intentionally a pure-UI class. It:
+
+- Owns no search state.
+- Knows nothing about documents, tabs, or rendering.
+- Forwards every action via the four callbacks injected at construction.
+- Exposes `set_status(text, color)` as the only channel back from the owner.
+
+This separation means the entire find logic can be tested without a live
+tkinter display (see `test_search_state.py`), and the dialog can be replaced
+or redesigned without touching `DocumentViewer`.
+
+---
+
+### 11.6 Why tkinterweb's native API and not HTML injection
+
+The alternative — wrapping matches in `<span id="match-N">` tags and
+rewriting the temp file per navigation step — was considered and rejected
+for these reasons:
+
+| Concern | HTML injection | tkinterweb native |
+|---|---|---|
+| Searches raw HTML | Yes — misses cross-tag text | No — searches rendered text |
+| Navigation cost | File write + load per step | One API call |
+| HTML entities | Need special handling | Transparent |
+| Separate active/all colours | Requires re-write per step | Configured once at construction |
+| Code complexity | High (regex/parser + file I/O) | Minimal delegation |
+
+---
+
+## 12. Configuration Reference
 
 All settings live in `src/config.py` inside the `AppConfig` dataclass.
 Import the singleton:
@@ -1193,6 +1497,10 @@ from config import cfg
 | `tab_color_hover` | `str` | `"#ebebeb"` | Background colour on mouse-over (inactive tabs only). |
 | `tab_bar_background` | `str` | `"#b8b8b8"` | Tab strip container background. |
 | `md_extensions` | `list[str]` | See below | Python-Markdown extension module names. |
+| `find_match_color` | `str` | `"#ffeb3b"` | Background for all matched text (yellow). |
+| `find_match_text_color` | `str` | `"#000000"` | Foreground for all matched text. |
+| `find_current_color` | `str` | `"#ff9800"` | Background for the active/current match (amber). |
+| `find_current_text_color` | `str` | `"#000000"` | Foreground for the active/current match. |
 
 **Default `md_extensions`:**
 
@@ -1214,9 +1522,9 @@ To add a Markdown extension (e.g. `pymdownx.superfences`), append it to
 
 ---
 
-## 12. Extending the Application
+## 13. Extending the Application
 
-### 12.1 Adding a new HTML renderer backend
+### 13.1 Adding a new HTML renderer backend
 
 1. Create a class that implements `RendererProtocol`:
 
@@ -1251,7 +1559,7 @@ def make_renderer(parent: tk.Widget) -> RendererProtocol:
 
 No other files need to change.
 
-### 12.2 Adding a new panel to the main window
+### 13.2 Adding a new panel to the main window
 
 1. Create a new `ttk.Frame` subclass in `src/views/`.
 2. In `MainWindow.__init__`, add it to the `ttk.PanedWindow`:
@@ -1265,7 +1573,7 @@ paned.add(self.my_panel, weight=1)
    construction time, following the same pattern as `on_file_open` in
    `FileExplorer` and `on_status_update` in `DocumentViewer`.
 
-### 12.3 Changing the Markdown theme
+### 13.3 Changing the Markdown theme
 
 Replace `src/resources/github.css` with any CSS you like. No code changes
 are required. The new CSS is picked up on next launch (or next call to
@@ -1278,7 +1586,7 @@ import utils.md_converter as mc
 mc._css_cache = None   # next conversion will re-read the file
 ```
 
-### 12.4 Adding a new configuration field
+### 13.4 Adding a new configuration field
 
 Add a field to `AppConfig` in `src/config.py`:
 
@@ -1292,7 +1600,7 @@ class AppConfig:
 The field is immediately available as `cfg.show_line_numbers` everywhere
 `from config import cfg` is in scope. No registration or plumbing needed.
 
-### 12.5 Implementing undo / redo
+### 13.5 Implementing undo / redo
 
 The `TabModel` mutation methods already return the information needed to
 reverse an operation (demoted `tab_id`, auto-promote candidate). A Command
@@ -1314,9 +1622,9 @@ class CommandHistory:
 
 ---
 
-## 13. Testing
+## 14. Testing
 
-### 13.1 Running tests
+### 14.1 Running tests
 
 ```bash
 # Install test dependencies
@@ -1332,7 +1640,7 @@ uv run --group test pytest tests/ -v
 uv run --group test pytest tests/test_tab_model.py::TestPromote -v
 ```
 
-### 13.2 Test structure
+### 14.2 Test structure
 
 ```
 tests/
@@ -1356,6 +1664,12 @@ tests/
 │     TestErrorCases            FileNotFoundError propagation
 │     TestCachedInstanceReset   no state bleed between calls, idempotent
 │
+├── test_search_state.py       (19 tests, 0 tkinter dependency)
+│     TestAdvance               forward navigation, wrap, single match, zero matches
+│     TestRetreat               backward navigation, wrap, symmetry
+│     TestSymmetry              advance-then-retreat, full cycle
+│     TestStatusText            "N of M", "No results", single result
+│
 └── test_temp_store.py         (20 tests, 0 tkinter dependency)
       TestWriteAndRelease        create, overwrite, uri_for, release, independence
       TestCleanupAll             removes html files, preserves non-html, empty safe
@@ -1363,7 +1677,7 @@ tests/
                                  single-quote attrs, write-with/without base_url
 ```
 
-### 13.3 What is NOT currently tested
+### 14.3 What is NOT currently tested
 
 | Area | Reason | How to test it |
 |---|---|---|
@@ -1372,7 +1686,7 @@ tests/
 | `_TabBar` | Widget creation needs Tk | Same as above |
 | `make_renderer` | ImportError branch | Mock `tkinterweb` with `unittest.mock` |
 
-### 13.4 Adding a new test
+### 14.4 Adding a new test
 
 1. Create `tests/test_<module>.py`.
 2. Add `sys.path` is already configured by `conftest.py` — no extra setup needed.
@@ -1388,9 +1702,9 @@ from utils.md_converter import convert_md_to_html
 
 ---
 
-## 14. Building the Executable
+## 15. Building the Executable
 
-### 14.1 Prerequisites
+### 15.1 Prerequisites
 
 ```bash
 uv sync --group build
@@ -1398,7 +1712,7 @@ uv sync --group build
 
 This installs `PyInstaller` into the virtualenv.
 
-### 14.2 Running the build
+### 15.2 Running the build
 
 ```bash
 uv run --group build python build_exe.py
@@ -1406,7 +1720,7 @@ uv run --group build python build_exe.py
 
 Output: `dist/MDViewer.exe` — a self-contained single-file executable.
 
-### 14.3 How the build script works
+### 15.3 How the build script works
 
 `build_exe.py` invokes `PyInstaller.__main__.run()` directly (no subprocess).
 Key arguments:
@@ -1420,7 +1734,7 @@ Key arguments:
 | `--hidden-import=...` | Belt-and-suspenders declarations for all app modules |
 | `--onefile --windowed` | Single executable, no console window |
 
-### 14.4 Adding a custom icon
+### 15.4 Adding a custom icon
 
 Place `mdviewer.ico` in the `resources/` directory (the one at the project
 root, not `src/resources/`). The build script checks for it automatically:
@@ -1430,7 +1744,7 @@ icon_path = os.path.join(script_dir, "resources", "mdviewer.ico")
 icon_args = [f"--icon={icon_path}"] if os.path.exists(icon_path) else []
 ```
 
-### 14.5 Debugging a failed build
+### 15.5 Debugging a failed build
 
 The most common failure mode is `ModuleNotFoundError` at runtime. Check:
 
@@ -1440,9 +1754,9 @@ The most common failure mode is `ModuleNotFoundError` at runtime. Check:
 
 ---
 
-## 15. Development Workflow
+## 16. Development Workflow
 
-### 15.1 Initial setup
+### 16.1 Initial setup
 
 ```bash
 git clone git@github.com:g-ro/mdviewer.git
@@ -1452,7 +1766,7 @@ uv sync --group test   # also installs pytest
 uv sync --group build  # also installs PyInstaller
 ```
 
-### 15.2 Running in development
+### 16.2 Running in development
 
 ```bash
 uv run python main.py
@@ -1468,7 +1782,7 @@ Alternatively, run the entry point directly:
 uv run python src/main.py
 ```
 
-### 15.3 Making changes to the tab model
+### 16.3 Making changes to the tab model
 
 `TabModel` has no UI dependency. Make your change, run the tests:
 
@@ -1479,13 +1793,13 @@ uv run --group test pytest tests/test_tab_model.py -v
 If the logic change affects the UI (e.g. a new return value from a mutation
 method), update the corresponding handler in `DocumentViewer` accordingly.
 
-### 15.4 Making changes to the CSS theme
+### 16.4 Making changes to the CSS theme
 
 Edit `src/resources/github.css`. Restart the application — the CSS file is
 read on the first conversion call and cached. Alternatively call
 `mc._css_cache = None` in a Python REPL attached to the running process.
 
-### 15.5 Changing the tab cap
+### 16.5 Changing the tab cap
 
 Edit `MAX_TABS` in `src/config.py`:
 
@@ -1497,7 +1811,7 @@ All overflow/eviction logic reads from `cfg.max_tabs`; no other changes needed.
 
 ---
 
-## 16. Known Constraints
+## 17. Known Constraints
 
 | Constraint | Impact | Notes |
 |---|---|---|

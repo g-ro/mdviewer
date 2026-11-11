@@ -58,6 +58,12 @@ class AppConfig:
         "markdown.extensions.footnotes",
     ])
 
+    # ── Find / search colours ─────────────────────────────────────────
+    find_match_color:         str = "#ffeb3b"   # yellow  — all matches
+    find_match_text_color:    str = "#000000"
+    find_current_color:       str = "#ff9800"   # amber   — active match
+    find_current_text_color:  str = "#000000"
+
 
 # Module-level singleton — import this everywhere
 cfg = AppConfig()

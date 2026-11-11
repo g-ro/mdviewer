@@ -66,6 +66,51 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 
 
 # ---------------------------------------------------------------------------
+# Search state
+# ---------------------------------------------------------------------------
+@dataclass
+class _SearchState:
+    """
+    Tracks the in-progress find session for the currently-visible tab.
+
+    ``current`` is 1-based to match tkinterweb's ``select`` parameter directly.
+    """
+    term:         str
+    ignore_case:  bool
+    match_count:  int   # 0 = no results
+    current:      int   # 1-based index of the highlighted match
+
+    # ------------------------------------------------------------------
+    def advance(self) -> bool:
+        """
+        Move to the next match (wrapping).
+        Returns ``True`` when wrapping from last → first.
+        """
+        if not self.match_count:
+            return False
+        wrapped = (self.current == self.match_count)
+        self.current = (self.current % self.match_count) + 1
+        return wrapped
+
+    def retreat(self) -> bool:
+        """
+        Move to the previous match (wrapping).
+        Returns ``True`` when wrapping from first → last.
+        """
+        if not self.match_count:
+            return False
+        wrapped = (self.current == 1)
+        self.current = ((self.current - 2) % self.match_count) + 1
+        return wrapped
+
+    @property
+    def status_text(self) -> str:
+        if self.match_count == 0:
+            return f"No results for '{self.term}'"
+        return f"{self.current} of {self.match_count}"
+
+
+# ---------------------------------------------------------------------------
 # Tab bar widget (visual only — no state knowledge)
 # ---------------------------------------------------------------------------
 @dataclass
@@ -193,6 +238,8 @@ class DocumentViewer(ttk.Frame):
         self._model            = TabModel(max_visible=cfg.max_tabs)
         self._temp_store       = TempHtmlStore()
         self._on_status_update = on_status_update
+        self._search_state:    _SearchState | None = None
+        self._search_bar                           = None   # SearchBar | None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -292,11 +339,38 @@ class DocumentViewer(ttk.Frame):
         data = self._model.get_visible(tab_id)
         if not data:
             return
+        self._clear_search_state()   # refresh invalidates current highlights
         html, base_url = self._render_file(data.file_path)
         self._model.update_visible_html(tab_id, html, base_url)
-        # Overwrite the existing temp file and reload
         self._temp_store.write(tab_id, html, base_url)
         self._renderer.load_url(self._temp_store.uri_for(tab_id))
+
+    # ------------------------------------------------------------------
+    # Find / search  (public — called by MainWindow)
+    # ------------------------------------------------------------------
+    def open_search(self) -> None:
+        """Open the find dialog, or refocus it if already open."""
+        # Lazy import avoids a circular dependency at module load time
+        from views.search_bar import SearchBar
+
+        if self._search_bar is not None:
+            try:
+                # Dialog still alive — just refocus
+                self._search_bar.focus_entry()
+                self._search_bar.lift()
+                return
+            except tk.TclError:
+                # Window was destroyed externally
+                self._search_bar = None
+
+        self._search_bar = SearchBar(
+            self.winfo_toplevel(),
+            on_search=self._on_search,
+            on_next=self._on_search_next,
+            on_previous=self._on_search_previous,
+            on_close=self._on_search_close,
+        )
+        self._search_bar.focus_entry()
 
     # ------------------------------------------------------------------
     # Visible-tab callbacks (wired to _TabBar)
@@ -304,6 +378,7 @@ class DocumentViewer(ttk.Frame):
     def _select_visible(self, tab_id: str) -> None:
         self._tab_bar.select(tab_id)
         if self._model.is_visible(tab_id):
+            self._clear_search_state()   # tab switch invalidates active search
             # Each tab has its own stable URI — no force, no caching issue
             self._renderer.load_url(self._temp_store.uri_for(tab_id))
 
@@ -417,3 +492,108 @@ class DocumentViewer(ttk.Frame):
     def _notify(self, message: str) -> None:
         if self._on_status_update:
             self._on_status_update(message)
+
+    # ------------------------------------------------------------------
+    # Search callbacks (wired to SearchBar)
+    # ------------------------------------------------------------------
+    def _on_search(self, term: str, case_sensitive: bool) -> None:
+        """Perform a fresh search for *term* in the active document."""
+        if not self._tab_bar.active_id:
+            if self._search_bar:
+                self._search_bar.set_status("No document open", "#888888")
+            return
+
+        ignore_case   = not case_sensitive
+        match_count   = self._renderer.find_text(term, index=1,
+                                                  ignore_case=ignore_case)
+
+        self._search_state = _SearchState(
+            term=term,
+            ignore_case=ignore_case,
+            match_count=match_count,
+            current=1 if match_count else 0,
+        )
+
+        if self._search_bar:
+            if match_count == 0:
+                self._search_bar.set_status(
+                    f"No results for '{term}'", "#cc0000"
+                )
+            else:
+                self._search_bar.set_status(
+                    self._search_state.status_text, "#1a7f1a"
+                )
+
+    def _on_search_next(self) -> None:
+        """Navigate to the next match, wrapping at the end."""
+        if not self._search_state or not self._search_state.match_count:
+            return
+
+        wrapped = self._search_state.advance()
+        self._renderer.find_text(
+            self._search_state.term,
+            index=self._search_state.current,
+            ignore_case=self._search_state.ignore_case,
+        )
+        self._update_search_ui(wrapped, forward=True)
+
+    def _on_search_previous(self) -> None:
+        """Navigate to the previous match, wrapping at the beginning."""
+        if not self._search_state or not self._search_state.match_count:
+            return
+
+        wrapped = self._search_state.retreat()
+        self._renderer.find_text(
+            self._search_state.term,
+            index=self._search_state.current,
+            ignore_case=self._search_state.ignore_case,
+        )
+        self._update_search_ui(wrapped, forward=False)
+
+    def _on_search_close(self) -> None:
+        """Clear highlights and close the find dialog."""
+        self._renderer.clear_find()
+        self._search_state = None
+        if self._search_bar is not None:
+            try:
+                self._search_bar.destroy()
+            except tk.TclError:
+                pass
+            self._search_bar = None
+
+    # ------------------------------------------------------------------
+    # Search helpers
+    # ------------------------------------------------------------------
+    def _update_search_ui(self, wrapped: bool, forward: bool) -> None:
+        """Update the SearchBar label and optionally post a wrap message."""
+        state = self._search_state
+        if not state:
+            return
+        # Update dialog counter
+        if self._search_bar:
+            self._search_bar.set_status(state.status_text, "#1a7f1a")
+
+        if wrapped:
+            if forward:
+                msg = "🔍 Reached end — wrapped to beginning"
+            else:
+                msg = "🔍 Reached beginning — wrapped to end"
+            # Both in the dialog status AND the main status bar
+            if self._search_bar:
+                self._search_bar.set_status(msg, "#cc6600")
+            self._notify(msg)
+
+    def _clear_search_state(self) -> None:
+        """
+        Clear highlights and reset search state without closing the dialog.
+        Called on tab switch and refresh so the dialog stays open but the
+        old results are not stale.
+        """
+        if self._search_state is not None:
+            self._renderer.clear_find()
+            self._search_state = None
+        if self._search_bar is not None:
+            try:
+                self._search_bar.set_status("")
+            except tk.TclError:
+                self._search_bar = None

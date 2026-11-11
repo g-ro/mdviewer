@@ -54,6 +54,7 @@ def build_exe() -> None:
         "--hidden-import=utils.md_converter",
         "--hidden-import=utils.renderer",
         "--hidden-import=utils.temp_store",
+        "--hidden-import=views.search_bar",
 
         # ── tkinter ────────────────────────────────────────────────────
         "--hidden-import=tkinter",
