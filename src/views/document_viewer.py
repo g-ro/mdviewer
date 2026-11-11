@@ -494,6 +494,20 @@ class DocumentViewer(ttk.Frame):
             self._on_status_update(message)
 
     # ------------------------------------------------------------------
+    # Public getter — used by MainWindow for export
+    # ------------------------------------------------------------------
+    def get_active_file_path(self) -> str | None:
+        """
+        Return the absolute file path of the currently active tab, or ``None``
+        if no document is open (welcome screen or overflow tabs only).
+        """
+        tab_id = self._tab_bar.active_id
+        if not tab_id:
+            return None
+        data = self._model.get_visible(tab_id)
+        return data.file_path if data else None
+
+    # ------------------------------------------------------------------
     # Search callbacks (wired to SearchBar)
     # ------------------------------------------------------------------
     def _on_search(self, term: str, case_sensitive: bool) -> None:

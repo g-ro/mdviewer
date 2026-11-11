@@ -3,16 +3,15 @@
 """
 Markdown → HTML converter.
 
-Improvements over the original
--------------------------------
-* CSS is loaded from ``src/resources/github.css`` (externalised).
-  A minimal inline fallback is used if the file cannot be read.
-* The ``markdown.Markdown`` instance is cached and reset between calls
-  instead of being reconstructed on every conversion.
-* The ``UnicodeDecodeError`` latin-1 fallback is now logged as a warning.
+Public API
+----------
+``convert_md_to_html(file_path)``    — used internally for tab rendering
+``convert_md_string_to_html(text)``  — utility for arbitrary strings
+``export_as_html(source, output)``   — user-facing export to a standalone HTML file
 """
 from __future__ import annotations
 
+import html as html_module
 import markdown
 from pathlib import Path
 
@@ -101,3 +100,44 @@ def convert_md_string_to_html(md_content: str) -> str:
     """Convert a Markdown string to a complete HTML document string."""
     body = _get_md().convert(md_content)
     return _HTML_TEMPLATE.format(css=_get_css(), body=body)
+
+
+def export_as_html(source_path: str | Path, output_path: str | Path) -> None:
+    """
+    Convert *source_path* from Markdown to a standalone HTML file at *output_path*.
+
+    Differences from the internal ``convert_md_to_html`` render:
+
+    * A ``<title>`` tag is injected using the source file's stem.
+    * Every relative ``src`` / ``href`` attribute is rewritten to an
+      absolute ``file://`` URL anchored at the source file's directory,
+      so images and links resolve correctly when the HTML is opened in a
+      browser from any location on the same machine.
+    * The output directory is created automatically if it does not exist.
+
+    Raises ``OSError`` on write failure.  Source-read errors (``OSError``,
+    ``UnicodeDecodeError``) propagate to the caller for display in the UI.
+    """
+    # Deferred import — avoids a circular dependency at module load time
+    # (temp_store → renderer; md_converter is imported by renderer indirectly)
+    from utils.temp_store import _make_urls_absolute
+
+    source = Path(source_path)
+    output = Path(output_path)
+    base_url = source.parent.as_uri() + "/"
+
+    # Fresh render from disk — always reflects the saved file, not any cache
+    html = convert_md_to_html(source)
+
+    # Inject <title> from the source filename (HTML-escaped)
+    title_tag = f"<title>{html_module.escape(source.stem)}</title>"
+    html = html.replace("<head>", f"<head>\n{title_tag}", 1)
+
+    # Rewrite relative src/href to absolute file:// URLs
+    html = _make_urls_absolute(html, base_url)
+
+    # Create output directory if it does not already exist
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(html, encoding="utf-8")
+    logger.info("Exported %s → %s", source, output)

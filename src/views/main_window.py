@@ -11,6 +11,7 @@ from pathlib import Path
 from views.file_explorer import FileExplorer
 from views.document_viewer import DocumentViewer
 from utils.logging_config import logger
+from utils.md_converter import export_as_html
 from version import (
     __title__, __description__, __version__,
     __author__, __license__, __copyright__, __website__,
@@ -81,6 +82,7 @@ class MainWindow:
         file_menu.add_command(label="Open Folder…",          command=self._open_folder_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="Find…            Ctrl+F", command=self.viewer.open_search)
+        file_menu.add_command(label="Export as HTML…  Ctrl+E", command=self._export_current)
         file_menu.add_separator()
         file_menu.add_command(label="Close Tab        Ctrl+W", command=self.viewer.close_current_tab)
         file_menu.add_separator()
@@ -98,6 +100,7 @@ class MainWindow:
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self._open_file_dialog())
         self.root.bind("<Control-f>", lambda _e: self.viewer.open_search())
+        self.root.bind("<Control-e>", lambda _e: self._export_current())
         self.root.bind("<Control-w>", lambda _e: self.viewer.close_current_tab())
         self.root.bind("<Control-r>", lambda _e: self.viewer.refresh_current_tab())
 
@@ -152,3 +155,43 @@ class MainWindow:
         if messagebox.askokcancel("Quit", "Do you want to quit MDViewer?"):
             logger.info("Shutting down")
             self.root.destroy()
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+    def _export_current(self) -> None:
+        """
+        Export the active tab's Markdown file as a standalone HTML file.
+
+        Opens a save-file dialog pre-populated with the source file's
+        directory and stem + ``.htm`` extension.  Silently returns if
+        no document is open or if the user cancels the dialog.
+        """
+        file_path = self.viewer.get_active_file_path()
+        if not file_path:
+            return   # welcome screen — nothing to export
+
+        source = Path(file_path)
+        output_path = filedialog.asksaveasfilename(
+            title="Export as HTML",
+            initialdir=str(source.parent),
+            initialfile=source.stem + ".htm",
+            defaultextension=".htm",
+            filetypes=[
+                ("HTML files", "*.htm *.html"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not output_path:
+            return   # user cancelled
+
+        try:
+            export_as_html(file_path, output_path)
+            self._status_var.set(f"Exported: {Path(output_path).name}")
+        except Exception as exc:
+            logger.exception("Export failed: %s → %s", file_path, output_path)
+            messagebox.showerror(
+                "Export Failed",
+                f"Could not write the HTML file:\n\n{exc}",
+            )
