@@ -56,9 +56,7 @@ blockquote > :last-child  { margin-bottom: 0; }
 table {
     border-spacing: 0;
     border-collapse: collapse;
-    display: block;
     width: 100%;
-    overflow: auto;
     margin: 0 0 16px 0;
 }
 table th { font-weight: 600; }
